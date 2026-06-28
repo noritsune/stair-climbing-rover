@@ -75,14 +75,28 @@ void setup() {
 
 void setupMotors() {
   for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
-    ledcAttach(MOTOR_IN1[i], MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
-    ledcAttach(MOTOR_IN2[i], MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+    bool ok1 = ledcAttach(MOTOR_IN1[i], MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+    bool ok2 = ledcAttach(MOTOR_IN2[i], MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+    Serial.printf("[Motor] %s  IN1=GPIO%d(%s)  IN2=GPIO%d(%s)\n",
+      WHEEL_LABELS[i],
+      MOTOR_IN1[i], ok1 ? "OK" : "NG",
+      MOTOR_IN2[i], ok2 ? "OK" : "NG");
   }
   stopAllMotors();
 }
 
 void setupServos() {
   Wire.begin(PCA9685_I2C_SDA, PCA9685_I2C_SCL);
+
+  // I2C スキャン（診断用・確認後は削除）
+  Serial.println("I2C スキャン開始...");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0)
+      Serial.printf("  I2C デバイス発見: 0x%02X\n", addr);
+  }
+  Serial.println("I2C スキャン完了");
+
   pwm.begin();
   pwm.setOscillatorFrequency(PCA9685_OSC_FREQ);
   pwm.setPWMFreq(SERVO_PWM_FREQ);
@@ -125,6 +139,16 @@ void loop() {
   bool options = PS4.Options();
   if (options && !prevOptions) recenterSteering();
   prevOptions = options;
+
+  // --- デバッグ出力（問題解析中のみ。確認後は #if 0 で無効化）-----------
+#if 1
+  static unsigned long dbgPrint = 0;
+  if (millis() - dbgPrint > 200) {
+    dbgPrint = millis();
+    Serial.printf("raw LX=%d LY=%d RX=%d RY=%d\n",
+        PS4.LStickX(), PS4.LStickY(), PS4.RStickX(), PS4.RStickY());
+  }
+#endif
 
   // --- 運動学 → 駆動 -------------------------------------------------------
   BodyTwist twist =
@@ -169,6 +193,14 @@ void updateWheels(const BodyTwist& command, float dt) {
     if (alignment < 0.0f) alignment = 0.0f;
     float drive = target.driveSpeed * alignment;
 
+    // デバッグ: 各輪の指令値（問題解析中のみ）
+#if 1
+    if (fabsf(drive) > DRIVE_SPEED_DEADBAND || fabsf(target.steerDeg) > 1.0f) {
+      Serial.printf("  [%s] steer=%.1f drive=%.3f align=%.2f\n",
+          WHEEL_LABELS[i], currentSteerDeg[i], drive, alignment);
+    }
+#endif
+
     applyDrive(i, drive);
   }
 }
@@ -207,6 +239,7 @@ void applySteer(uint8_t wheel, float outputDeg) {
 // ---------------------------------------------------------------------------
 // driveSpeed は符号付き m/s。IN1 = 正転 / IN2 = 逆転。両方 0 でコースト停止。
 void applyDrive(uint8_t wheel, float driveSpeed) {
+  if (MOTOR_REVERSED[wheel]) driveSpeed = -driveSpeed;
   float mag = fabsf(driveSpeed);
   if (mag < DRIVE_SPEED_DEADBAND) {
     ledcWrite(MOTOR_IN1[wheel], 0);
