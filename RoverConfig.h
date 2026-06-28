@@ -36,9 +36,9 @@ static const char* const WHEEL_LABELS[WHEEL_COUNT] = {
 // ---------------------------------------------------------------------------
 // 寸法（メートル）
 // ---------------------------------------------------------------------------
-constexpr float HALF_WHEELBASE = 0.75f;  // ボディ中心 → 前後輪軸 (+Z)
-constexpr float HALF_TRACK     = 0.60f;  // ボディ中心 → 左右輪 (+X)
-constexpr float WHEEL_RADIUS   = 0.22f;  // タイヤ半径
+constexpr float HALF_WHEELBASE = 0.158f;  // ボディ中心 → 前後輪軸 (+Z)
+constexpr float HALF_TRACK     = 0.130f;  // ボディ中心 → 左右輪 (+X)
+constexpr float WHEEL_RADIUS   = 0.05f;  // タイヤ半径
 
 // 各輪の平面位置（x = 右オフセット, y = 前方オフセット）、FL..BR 順。
 constexpr float WHEEL_POS_X[WHEEL_COUNT] = {
