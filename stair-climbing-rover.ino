@@ -23,7 +23,7 @@
 //   左スティック Y  : 前進 / 後退
 //   左スティック X  : 左右並進（カニ歩き）
 //   右スティック X  : 旋回
-//   R1（押しっぱなし）: ブースト
+//   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
 //   Options         : 全ステアを 0° にリセンター
 
 #include <PS4Controller.h>
@@ -128,7 +128,7 @@ void loop() {
   float leftY  = normStick(PS4.LStickY());
   float rightX = normStick(PS4.RStickX());
   float rightY = normStick(PS4.RStickY());
-  float speedScale = PS4.R1() ? BOOST_MULTIPLIER : 1.0f;
+  float speedScale = PS4.R1() ? BOOST_MULTIPLIER : 0.7f;
 
   // Options ボタン: 全ステアを 0° にリセンター（立ち上がりエッジのみ）
   bool options = PS4.Options();
@@ -145,11 +145,59 @@ void loop() {
   }
 #endif
 
+  // --- 配線確認モード（スティック中立時にボタン単押しで個別輪を回転）----------
+  // 十字上 : FL+BL 正転   十字下 : FL+BL 逆転
+  // 十字左 : ML   正転   十字右 : ML   逆転
+  // △     : FR+BR 正転   ✕     : FR+BR 逆転
+  // ○     : MR   正転   □     : MR   逆転
+  bool sticksNeutral = (fabsf(leftX) < STICK_DEADZONE
+                     && fabsf(leftY) < STICK_DEADZONE
+                     && fabsf(rightX) < STICK_DEADZONE);
+  bool wireTestHandled = false;
+  if (sticksNeutral) {
+    constexpr float WIRE_TEST_SPEED = 1.0f;
+    float flCmd = 0.0f, mlCmd = 0.0f, frCmd = 0.0f, mrCmd = 0.0f;
+    const char* wireLabel = nullptr;
+
+    if (PS4.Up()) {
+      flCmd = +WIRE_TEST_SPEED; wireLabel = "FL+BL 正転";
+    } else if (PS4.Down()) {
+      flCmd = -WIRE_TEST_SPEED; wireLabel = "FL+BL 逆転";
+    } else if (PS4.Left()) {
+      mlCmd = +WIRE_TEST_SPEED; wireLabel = "ML 正転";
+    } else if (PS4.Right()) {
+      mlCmd = -WIRE_TEST_SPEED; wireLabel = "ML 逆転";
+    } else if (PS4.Triangle()) {
+      frCmd = +WIRE_TEST_SPEED; wireLabel = "FR+BR 正転";
+    } else if (PS4.Cross()) {
+      frCmd = -WIRE_TEST_SPEED; wireLabel = "FR+BR 逆転";
+    } else if (PS4.Circle()) {
+      mrCmd = +WIRE_TEST_SPEED; wireLabel = "MR 正転";
+    } else if (PS4.Square()) {
+      mrCmd = -WIRE_TEST_SPEED; wireLabel = "MR 逆転";
+    }
+
+    if (wireLabel) {
+      stopAllMotors();
+      if (flCmd != 0.0f) applyDrive(W_FL, flCmd);
+      if (mlCmd != 0.0f) applyDrive(W_ML, mlCmd);
+      if (frCmd != 0.0f) applyDrive(W_FR, frCmd);
+      if (mrCmd != 0.0f) applyDrive(W_MR, mrCmd);
+      wireTestHandled = true;
+      static unsigned long dbgWire = 0;
+      if (millis() - dbgWire > 500) {
+        dbgWire = millis();
+        Serial.printf("[配線確認] %s\n", wireLabel);
+      }
+    }
+  }
+
   // --- 運動学 → 駆動 -------------------------------------------------------
-  // rightX を反転: MOTOR_REVERSED の向きに合わせた旋回方向補正。
-  BodyTwist twist =
-      rover::mapSticks(leftX, leftY, -rightX, rightY, kLimits, speedScale);
-  updateWheels(twist, dt);
+  if (!wireTestHandled) {
+    BodyTwist twist =
+        rover::mapSticks(leftX, leftY, rightX, rightY, kLimits, speedScale);
+    updateWheels(twist, dt);
+  }
 
   delay(CONTROL_PERIOD_MS);
 }
@@ -258,7 +306,6 @@ void applySteer(uint8_t wheel, float outputDeg) {
 // ---------------------------------------------------------------------------
 // driveSpeed は符号付き m/s。IN1 = 正転 / IN2 = 逆転。両方 0 でコースト停止。
 void applyDrive(uint8_t wheel, float driveSpeed) {
-  if (MOTOR_REVERSED[wheel]) driveSpeed = -driveSpeed;
   float mag = fabsf(driveSpeed);
   if (mag < DRIVE_SPEED_DEADBAND) {
     ledcWrite(MOTOR_IN1[wheel], 0);

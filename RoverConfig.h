@@ -62,7 +62,7 @@ constexpr float LINEAR_SPEED_RATIO   = 1.0f;  // 並進（左スティック Y/X
 constexpr float ROTATION_SPEED_RATIO = 1.0f;  // 旋回（右スティック X）、最外輪基準
 
 constexpr float BOOST_MULTIPLIER = 2.2f;   // R1 押下中の速度倍率
-constexpr float STICK_DEADZONE   = 0.12f;  // スティックのデッドゾーン（円形、0..1）
+constexpr float STICK_DEADZONE   = 0.20f;  // スティックのデッドゾーン（円形、0..1）
 
 // サーボのスルーレート（deg/s）。60° / 0.13 秒 ≈ 461.5°/s。
 // パターンB では 2:1 ギア相当のため .ino 側で 2 倍する。
@@ -98,19 +98,7 @@ constexpr uint8_t  MOTOR_PWM_BITS = 8;     // 8ビット → 0..255
 // Driver C (ledc ×0): BL(ch1) + BR(ch2)
 //   └─ 入力ピンは Driver A ch1 (FL) と Driver B ch1 (FR) を直結共用。
 //      GPIO への ledcAttach は FL/FR 分のみ行い BL/BR は重複スキップ。
-//
-// IN1 = 正転 / IN2 = 逆転。
-// MOTOR_REVERSED: モーターが逆向きに取り付けられている輪を反転する。
-// 左輪は右輪と鏡像になるため、通常は左輪（FL/ML/BL）を true にする。
 // ---------------------------------------------------------------------------
-constexpr bool MOTOR_REVERSED[WHEEL_COUNT] = {
-  true,  // FL
-  true, // FR
-  true,  // ML
-  true, // MR
-  true,  // BL
-  true, // BR
-};
 
 constexpr uint8_t MOTOR_IN1[WHEEL_COUNT] = {
   16, // FL 正転  (Driver A ch1)
