@@ -8,7 +8,7 @@
 - サーボ追従中はモーター出力を `cos(角度誤差)` でゲーティングし、横滑りを防ぐ。
 - **起動時は全輪 0°**（サーボはセンター）。
 
-![moving](moving.mp4)
+<video src="./moving.mp4" width="100%" controls muted></video>
 
 ## ハードウェア構成
 
