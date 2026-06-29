@@ -83,51 +83,62 @@ constexpr uint32_t MOTOR_PWM_FREQ = 1000;  // Hz
 constexpr uint8_t  MOTOR_PWM_BITS = 8;     // 8ビット → 0..255
 
 // ---------------------------------------------------------------------------
-// DRV8833 ピン配置（ドライバー 3個 × 各2モーター）
+// DRV8833 ピン配置（ドライバー 3個）
+//
+// Driver A (ledc ×4): FL(ch1) + ML(ch2)
+// Driver B (ledc ×4): FR(ch1) + MR(ch2)
+// Driver C (ledc ×0): BL(ch1) + BR(ch2)
+//   └─ 入力ピンは Driver A ch1 (FL) と Driver B ch1 (FR) を直結共用。
+//      GPIO への ledcAttach は FL/FR 分のみ行い BL/BR は重複スキップ。
+//
 // IN1 = 正転 / IN2 = 逆転。
 // MOTOR_REVERSED: モーターが逆向きに取り付けられている輪を反転する。
 // 左輪は右輪と鏡像になるため、通常は左輪（FL/ML/BL）を true にする。
 // ---------------------------------------------------------------------------
 constexpr bool MOTOR_REVERSED[WHEEL_COUNT] = {
-  true, // FL
-  false,  // FR
-  true, // ML
-  false,  // MR
-  true, // BL
-  false,  // BR
+  true,  // FL
+  false, // FR
+  true,  // ML
+  false, // MR
+  true,  // BL
+  false, // BR
 };
 
 constexpr uint8_t MOTOR_IN1[WHEEL_COUNT] = {
-  32, // FL 正転
-  16, // FR 正転
-  27, // ML 正転
-  23, // MR 正転
-  18, // BL 正転
-  21  // BR 正転
+  16, // FL 正転  (Driver A ch1)
+  22, // FR 正転  (Driver B ch1)
+  18, // ML 正転  (Driver A ch2)
+  19, // MR 正転  (Driver B ch2)
+  16, // BL 正転  (Driver C ch1 = Driver A ch1 共用)
+  22  // BR 正転  (Driver C ch2 = Driver B ch1 共用)
 };
 constexpr uint8_t MOTOR_IN2[WHEEL_COUNT] = {
-  33, // FL 逆転
-   4, // FR 逆転
-  14, // ML 逆転
-  22, // MR 逆転
-  17, // BL 逆転
-  19  // BR 逆転
+   4, // FL 逆転  (Driver A ch1)
+  23, // FR 逆転  (Driver B ch1)
+  17, // ML 逆転  (Driver A ch2)
+  21, // MR 逆転  (Driver B ch2)
+   4, // BL 逆転  (Driver C ch1 = Driver A ch1 共用)
+  23  // BR 逆転  (Driver C ch2 = Driver B ch1 共用)
 };
 
 // ---------------------------------------------------------------------------
-// PCA9685 ステアリングサーボ
+// ステアリングサーボ直結（DS3235 ×6、サーボドライバ基板なし、ledc ×6）
+//
+// 使用 GPIO: 旧 BL/BR IN ピン (17,18,19,21) と 旧 I2C ピン (25,26) を転用。
 // ---------------------------------------------------------------------------
-constexpr uint8_t  PCA9685_I2C_SDA  = 13;   // I2C SDA
-constexpr uint8_t  PCA9685_I2C_SCL  = 26;   // I2C SCL
-constexpr uint8_t  PCA9685_I2C_ADDR = 0x40;
-constexpr float    PCA9685_OSC_FREQ = 27000000.0f;  // writeMicroseconds() 用
-constexpr uint16_t SERVO_PWM_FREQ   = 50;           // Hz（標準アナログサーボ）
+constexpr uint8_t SERVO_PIN[WHEEL_COUNT] = {
+  14, // FL サーボ GPIO
+  27, // FR サーボ GPIO
+  26, // ML サーボ GPIO
+  25, // MR サーボ GPIO
+  33, // BL サーボ GPIO
+  32  // BR サーボ GPIO
+};
 
-// 各輪の PCA9685 チャンネル（FL..BR 順）。
-constexpr uint8_t SERVO_CHANNEL[WHEEL_COUNT] = { 5, 4, 3, 2, 1, 0 };
+constexpr uint16_t SERVO_PWM_FREQ = 50;   // Hz（DS3235 標準）
+constexpr uint8_t  SERVO_PWM_BITS = 16;   // 16ビット分解能（パルス幅精度向上）
 
 // サーボのパルス幅キャリブレーション（マイクロ秒、0..180° の両端）。
-// 実機サーボに合わせて調整する。一般的な値: 500..2500 us。
 constexpr uint16_t SERVO_MIN_US = 500;
 constexpr uint16_t SERVO_MAX_US = 2500;
 

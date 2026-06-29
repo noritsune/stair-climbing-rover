@@ -2,7 +2,7 @@
 // 6輪全輪ステアローバー実機用 ESP32 ファームウェア。
 //
 // 操縦感は Unity 製 rover-simulator の「パターンB (B_WideRange)」を実機へ移植したもの:
-//   * 各輪は広角（2:1 ギア）サーボを PCA9685 で駆動し、±180° の範囲で直接目標方向を向く。
+//   * 各輪は広角（2:1 ギア）サーボを GPIO 直結 ledc で駆動し、±180° の範囲で直接目標方向を向く。
 //   * ステアのスルーレートは 2 倍（2:1 ギア相当）。
 //   * 逆転フリップ最適化: 目標まで 90° 超の旋回が必要なときは、モーターを逆転して
 //     目標±180° を狙い、サーボの実際の移動量を 90° 未満に抑える。
@@ -18,7 +18,6 @@
 //
 // 必要ライブラリ（Arduino Library Manager でインストール）:
 //   * PS4-esp32  (aed3)
-//   * Adafruit PWM Servo Driver Library
 //
 // 操作方法:
 //   左スティック Y  : 前進 / 後退
@@ -27,9 +26,7 @@
 //   R1（押しっぱなし）: ブースト
 //   Options         : 全ステアを 0° にリセンター
 
-#include <Wire.h>
 #include <PS4Controller.h>
-#include <Adafruit_PWMServoDriver.h>
 
 #include "RoverConfig.h"
 #include "RoverKinematics.h"
@@ -41,8 +38,6 @@ using rover::KinLimits;
 // ---------------------------------------------------------------------------
 // 状態変数
 // ---------------------------------------------------------------------------
-static Adafruit_PWMServoDriver pwm =
-    Adafruit_PWMServoDriver(PCA9685_I2C_ADDR);
 
 // 各ステアリングサーボの出力角（度、±180）のソフトウェアモデル。
 // スルーレート制限はここで行い、実際に向いている角度をドライブゲートにも使う。
@@ -75,6 +70,16 @@ void setup() {
 
 void setupMotors() {
   for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
+    // BL/BR は FL/FR と同じピンを共用するため、重複 attach をスキップ
+    bool duplicate = false;
+    for (uint8_t j = 0; j < i; j++) {
+      if (MOTOR_IN1[j] == MOTOR_IN1[i]) { duplicate = true; break; }
+    }
+    if (duplicate) {
+      Serial.printf("[Motor] %s  IN1=GPIO%d(共用)  IN2=GPIO%d(共用)\n",
+        WHEEL_LABELS[i], MOTOR_IN1[i], MOTOR_IN2[i]);
+      continue;
+    }
     bool ok1 = ledcAttach(MOTOR_IN1[i], MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
     bool ok2 = ledcAttach(MOTOR_IN2[i], MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
     Serial.printf("[Motor] %s  IN1=GPIO%d(%s)  IN2=GPIO%d(%s)\n",
@@ -86,21 +91,11 @@ void setupMotors() {
 }
 
 void setupServos() {
-  Wire.begin(PCA9685_I2C_SDA, PCA9685_I2C_SCL);
-
-  // I2C スキャン（診断用・確認後は削除）
-  Serial.println("I2C スキャン開始...");
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0)
-      Serial.printf("  I2C デバイス発見: 0x%02X\n", addr);
+  for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
+    bool ok = ledcAttach(SERVO_PIN[i], SERVO_PWM_FREQ, SERVO_PWM_BITS);
+    Serial.printf("[Servo] %s  GPIO%d(%s)\n",
+      WHEEL_LABELS[i], SERVO_PIN[i], ok ? "OK" : "NG");
   }
-  Serial.println("I2C スキャン完了");
-
-  pwm.begin();
-  pwm.setOscillatorFrequency(PCA9685_OSC_FREQ);
-  pwm.setPWMFreq(SERVO_PWM_FREQ);
-  delay(10);
 
   // 起動時: 全輪 0°（サーボはセンター）
   for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
@@ -166,6 +161,8 @@ void updateWheels(const BodyTwist& command, float dt) {
   // パターンB は 2:1 ワイドレンジギア相当のため、スルーレートを 2 倍にする。
   float maxStep = STEER_RATE_DEG_PER_SEC * dt * 2.0f;
 
+  // --- ステア更新 + 各輪のドライブ速度を計算 --------------------------------
+  float driveOut[WHEEL_COUNT];
   for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
     WheelCommand target = rover::computeWheelWideRange(
         WHEEL_POS_X[i], WHEEL_POS_Y[i], command,
@@ -184,25 +181,41 @@ void updateWheels(const BodyTwist& command, float dt) {
 
     // サーボモデルをスルーレート制限しながら目標へ近づける。
     currentSteerDeg[i] = rover::kinMoveTowards(currentSteerDeg[i], target.steerDeg, maxStep);
-    float actual = currentSteerDeg[i];
-    applySteer(i, actual);
+    applySteer(i, currentSteerDeg[i]);
 
     // 追従中は cos(誤差) でドライブをゲーティング（横滑り防止）。
-    float errorRad  = rover::kinDeltaAngle(actual, target.steerDeg) * rover::KIN_DEG2RAD;
+    float errorRad  = rover::kinDeltaAngle(currentSteerDeg[i], target.steerDeg) * rover::KIN_DEG2RAD;
     float alignment = cosf(errorRad);
     if (alignment < 0.0f) alignment = 0.0f;
-    float drive = target.driveSpeed * alignment;
+    driveOut[i] = target.driveSpeed * alignment;
+  }
 
-    // デバッグ: 各輪の指令値（問題解析中のみ）
+  // --- FL/BL、FR/BR は共用ピンなので平均値で駆動 ---------------------------
+  float avgFLBL = (driveOut[W_FL] + driveOut[W_BL]) * 0.5f;
+  float avgFRBR = (driveOut[W_FR] + driveOut[W_BR]) * 0.5f;
+
+  // デバッグ: 各輪の指令値（問題解析中のみ）
 #if 1
-    if (fabsf(drive) > DRIVE_SPEED_DEADBAND || fabsf(target.steerDeg) > 1.0f) {
-      Serial.printf("  [%s] steer=%.1f drive=%.3f align=%.2f\n",
-          WHEEL_LABELS[i], currentSteerDeg[i], drive, alignment);
+  static unsigned long dbgDrive = 0;
+  if (millis() - dbgDrive > 200) {
+    dbgDrive = millis();
+    float dbgDrives[WHEEL_COUNT] = {
+      avgFLBL, avgFRBR, driveOut[W_ML], driveOut[W_MR], avgFLBL, avgFRBR
+    };
+    for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
+      if (fabsf(dbgDrives[i]) > DRIVE_SPEED_DEADBAND || fabsf(currentSteerDeg[i]) > 1.0f) {
+        Serial.printf("  [%s] steer=%.1f drive=%.3f\n",
+            WHEEL_LABELS[i], currentSteerDeg[i], dbgDrives[i]);
+      }
     }
+  }
 #endif
 
-    applyDrive(i, drive);
-  }
+  // 共用ピンは FL/FR 側のみ書き込む（BL/BR は物理的に同じ信号を受ける）。
+  applyDrive(W_FL, avgFLBL);
+  applyDrive(W_FR, avgFRBR);
+  applyDrive(W_ML, driveOut[W_ML]);
+  applyDrive(W_MR, driveOut[W_MR]);
 }
 
 void recenterSteering() {
@@ -214,7 +227,7 @@ void recenterSteering() {
 }
 
 // ---------------------------------------------------------------------------
-// ハードウェア出力: ステアリングサーボ（PCA9685）
+// ハードウェア出力: ステアリングサーボ（DS3235 GPIO 直結、ledc）
 // ---------------------------------------------------------------------------
 // outputDeg は車輪のステア角（±180°）。
 // 2:1 ワイドレンジギア: servo = outputDeg / 2 + 90
@@ -231,7 +244,12 @@ void applySteer(uint8_t wheel, float outputDeg) {
 
   uint16_t us = (uint16_t)(SERVO_MIN_US +
       (servoDeg / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US));
-  pwm.writeMicroseconds(SERVO_CHANNEL[wheel], us);
+
+  // ledc duty = us / period_us * (2^bits)
+  // period_us = 1,000,000 / SERVO_PWM_FREQ = 20,000 us
+  constexpr uint32_t PERIOD_US = 1000000UL / SERVO_PWM_FREQ;
+  uint32_t duty = (uint32_t)us * (1UL << SERVO_PWM_BITS) / PERIOD_US;
+  ledcWrite(SERVO_PIN[wheel], duty);
 }
 
 // ---------------------------------------------------------------------------
