@@ -13,8 +13,8 @@
 // コントローラー
 // ---------------------------------------------------------------------------
 
-// Sixaxis Pair Tool でDS4に書き込む固定MACアドレス（全マイコン共通）。
-#define PS4_MAC_ADDRESS "aa:bb:cc:dd:ee:ff"
+// Sixaxis Pair Tool でDS4に書き込む固定MACアドレス(メインPCのもの)。
+#define PS4_MAC_ADDRESS "00:02:5b:00:a5:c9"
 
 // ---------------------------------------------------------------------------
 // 輪のインデックス（固定順序）
@@ -53,12 +53,16 @@ constexpr float WHEEL_POS_Y[WHEEL_COUNT] = {
 };
 
 // ---------------------------------------------------------------------------
-// 速度・入力
+// 速度・入力（スティック感度）
 // ---------------------------------------------------------------------------
-constexpr float MAX_LINEAR_SPEED      = 1.8f;   // m/s（並進最大速度）
-constexpr float MAX_ANGULAR_SPEED_DEG = 80.0f;  // deg/s（旋回最大角速度）
-constexpr float BOOST_MULTIPLIER      = 2.2f;   // R1 押下中の速度倍率
-constexpr float STICK_DEADZONE        = 0.12f;  // スティックのデッドゾーン（円形、0..1）
+// フルスティックでのデューティ比率（0.0〜1.0 で指定）。
+//   1.0 = フルスティックでモーター最大デューティ（255）
+//   0.5 = フルスティックで 50% デューティ
+constexpr float LINEAR_SPEED_RATIO   = 1.0f;  // 並進（左スティック Y/X）
+constexpr float ROTATION_SPEED_RATIO = 1.0f;  // 旋回（右スティック X）、最外輪基準
+
+constexpr float BOOST_MULTIPLIER = 2.2f;   // R1 押下中の速度倍率
+constexpr float STICK_DEADZONE   = 0.12f;  // スティックのデッドゾーン（円形、0..1）
 
 // サーボのスルーレート（deg/s）。60° / 0.13 秒 ≈ 461.5°/s。
 // パターンB では 2:1 ギア相当のため .ino 側で 2 倍する。
@@ -70,13 +74,17 @@ constexpr float MAX_STEER_DEG = 180.0f;
 // ---------------------------------------------------------------------------
 // 走行モーター（運動学 m/s → DRV8833 PWMデューティ）
 // ---------------------------------------------------------------------------
-// デューティ正規化の基準速度。フルスティック（ブーストなし）でこの速度 = 最大デューティ。
-// ブースト（R1）押下時は運動学出力がこれを超えるが、constrain() で 255 にクランプされる。
-// 大きくすると最高速が下がる。小さくすると体感速度が上がる（モーターへの負担に注意）。
-constexpr float MAX_WHEEL_SPEED_MPS = MAX_LINEAR_SPEED;  // 1.8 m/s → フルスティック = 100% PWM
+// モーター最大地面速度（フルデューティ時の推定値）。duty = |speed| / this × 255。
+constexpr float MAX_WHEEL_SPEED_MPS = 1.8f;
+// 最外輪の旋回半径 = sqrt(HALF_TRACK² + HALF_WHEELBASE²) = sqrt(0.130²+0.158²)
+constexpr float MAX_SPIN_RADIUS_M   = 0.2046f;
+// 運動学への入力値（比率から自動計算、変更不要）
+constexpr float MAX_LINEAR_SPEED      = LINEAR_SPEED_RATIO * MAX_WHEEL_SPEED_MPS;
+constexpr float MAX_ANGULAR_SPEED_DEG = ROTATION_SPEED_RATIO * MAX_WHEEL_SPEED_MPS
+                                        / MAX_SPIN_RADIUS_M * 57.2957795f;
 
 constexpr float   DRIVE_SPEED_DEADBAND = 0.02f;   // これ未満はモーター停止（m/s）
-constexpr uint8_t MOTOR_MIN_DUTY = 0;             // 停動するなら 40 程度に上げる
+constexpr uint8_t MOTOR_MIN_DUTY = 60;            // 静止摩擦を超える最低デューティ（要調整）
 constexpr uint8_t MOTOR_MAX_DUTY = 255;           // 8ビットPWM
 
 constexpr uint32_t MOTOR_PWM_FREQ = 1000;  // Hz
@@ -97,11 +105,11 @@ constexpr uint8_t  MOTOR_PWM_BITS = 8;     // 8ビット → 0..255
 // ---------------------------------------------------------------------------
 constexpr bool MOTOR_REVERSED[WHEEL_COUNT] = {
   true,  // FL
-  false, // FR
+  true, // FR
   true,  // ML
-  false, // MR
+  true, // MR
   true,  // BL
-  false, // BR
+  true, // BR
 };
 
 constexpr uint8_t MOTOR_IN1[WHEEL_COUNT] = {

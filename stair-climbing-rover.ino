@@ -146,8 +146,9 @@ void loop() {
 #endif
 
   // --- 運動学 → 駆動 -------------------------------------------------------
+  // rightX を反転: MOTOR_REVERSED の向きに合わせた旋回方向補正。
   BodyTwist twist =
-      rover::mapSticks(leftX, leftY, rightX, rightY, kLimits, speedScale);
+      rover::mapSticks(leftX, leftY, -rightX, rightY, kLimits, speedScale);
   updateWheels(twist, dt);
 
   delay(CONTROL_PERIOD_MS);
