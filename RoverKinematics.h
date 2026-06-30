@@ -1,12 +1,12 @@
 // RoverKinematics.h
-// ハードウェア非依存のピュア運動学。パターンB（±180° 広角ステア）に対応。
+// ハードウェア非依存のピュア運動学。パターンB（±189° 広角ステア）に対応。
 //
 // Arduino / PCA / DRV の依存を持たないため、ホスト PC で単体テスト可能。
 // .ino からインクルードし、計算結果をサーボ・モーターへ渡す。
 //
 // 座標系（RoverConfig.h と同一）:
 //   ボディ局所座標: +Z 前方 / +X 右。
-//   ステア角 0° = 前方 / ±180° が最大範囲。
+//   ステア角 0° = 前方 / ±189° が最大範囲。
 //   ヨーレート正 = 右旋回（上から見て時計回り）。
 #pragma once
 
@@ -27,7 +27,7 @@ struct BodyTwist {
 
 // 1輪の指令値: 向く角度と転動速度。
 struct WheelCommand {
-  float steerDeg;    // 0° = 前方 (+Z)、±180° 範囲
+  float steerDeg;    // 0° = 前方 (+Z)、±189° 範囲
   float driveSpeed;  // 符号付き地面速度 m/s（負 = 後退方向に転動）
 };
 
@@ -128,7 +128,7 @@ inline WheelCommand computeWheelWideRange(float posX, float posY,
     return WheelCommand{ previousSteerDeg, 0.0f };
   }
 
-  // +Z を基準とした走行方向（+X 方向が正）。[-180, 180]
+  // +Z を基準とした走行方向（+X 方向が正）。[-189, 189]
   float raw   = atan2f(vx, vz) * KIN_RAD2DEG;
   float steer = kinClamp(raw, -maxSteerDeg, maxSteerDeg);
   return WheelCommand{ steer, speed };  // ドライブは常に正
