@@ -180,39 +180,36 @@ void loop() {
   }
 #endif
 
-  // --- 配線確認モード（スティック中立時にボタン単押しで個別輪を回転）----------
+  // --- 配線確認モード（スティック中立時にボタンで個別輪を回転、複数同時対応）---
   // 十字上 : FL+BL 正転   十字下 : FL+BL 逆転
   // 十字左 : ML   正転   十字右 : ML   逆転
   // △     : FR+BR 正転   ✕     : FR+BR 逆転
   // ○     : MR   正転   □     : MR   逆転
+  // ボタン押下中: 全サーボを 0° に固定 / 全力駆動
   bool sticksNeutral = (fabsf(leftX) < STICK_DEADZONE
                      && fabsf(leftY) < STICK_DEADZONE
                      && fabsf(rightX) < STICK_DEADZONE);
   bool wireTestHandled = false;
   if (sticksNeutral) {
-    constexpr float WIRE_TEST_SPEED = 1.0f;
+    const float WIRE_TEST_SPEED = MAX_WHEEL_SPEED_MPS;  // 常に全力
     float flCmd = 0.0f, mlCmd = 0.0f, frCmd = 0.0f, mrCmd = 0.0f;
-    const char* wireLabel = nullptr;
 
-    if (PS4.Up()) {
-      flCmd = +WIRE_TEST_SPEED; wireLabel = "FL+BL 正転";
-    } else if (PS4.Down()) {
-      flCmd = -WIRE_TEST_SPEED; wireLabel = "FL+BL 逆転";
-    } else if (PS4.Left()) {
-      mlCmd = +WIRE_TEST_SPEED; wireLabel = "ML 正転";
-    } else if (PS4.Right()) {
-      mlCmd = -WIRE_TEST_SPEED; wireLabel = "ML 逆転";
-    } else if (PS4.Triangle()) {
-      frCmd = +WIRE_TEST_SPEED; wireLabel = "FR+BR 正転";
-    } else if (PS4.Cross()) {
-      frCmd = -WIRE_TEST_SPEED; wireLabel = "FR+BR 逆転";
-    } else if (PS4.Circle()) {
-      mrCmd = +WIRE_TEST_SPEED; wireLabel = "MR 正転";
-    } else if (PS4.Square()) {
-      mrCmd = -WIRE_TEST_SPEED; wireLabel = "MR 逆転";
-    }
+    if (PS4.Up())       flCmd = +WIRE_TEST_SPEED;
+    if (PS4.Down())     flCmd = -WIRE_TEST_SPEED;
+    if (PS4.Left())     mlCmd = +WIRE_TEST_SPEED;
+    if (PS4.Right())    mlCmd = -WIRE_TEST_SPEED;
+    if (PS4.Triangle()) frCmd = +WIRE_TEST_SPEED;
+    if (PS4.Cross())    frCmd = -WIRE_TEST_SPEED;
+    if (PS4.Circle())   mrCmd = +WIRE_TEST_SPEED;
+    if (PS4.Square())   mrCmd = -WIRE_TEST_SPEED;
 
-    if (wireLabel) {
+    bool anyButton = (flCmd != 0.0f || mlCmd != 0.0f || frCmd != 0.0f || mrCmd != 0.0f);
+    if (anyButton) {
+      // 全サーボを 0° に固定
+      for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
+        currentSteerDeg[i] = 0.0f;
+        applySteer(i, 0.0f);
+      }
       stopAllMotors();
       if (flCmd != 0.0f) applyDrive(W_FL, flCmd);
       if (mlCmd != 0.0f) applyDrive(W_ML, mlCmd);
@@ -222,7 +219,8 @@ void loop() {
       static unsigned long dbgWire = 0;
       if (millis() - dbgWire > 500) {
         dbgWire = millis();
-        Serial.printf("[配線確認] %s\n", wireLabel);
+        Serial.printf("[配線確認] FL=%+.0f ML=%+.0f FR=%+.0f MR=%+.0f\n",
+            flCmd, mlCmd, frCmd, mrCmd);
       }
     }
   }
