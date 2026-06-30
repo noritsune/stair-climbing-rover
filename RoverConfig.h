@@ -13,8 +13,8 @@
 // コントローラー
 // ---------------------------------------------------------------------------
 
-// Sixaxis Pair Tool でDS4に書き込む固定MACアドレス(メインPCのもの)。
-#define PS4_MAC_ADDRESS "00:02:5b:00:a5:c9"
+// Sixaxis Pair Tool でDS4に書き込む固定MACアドレス(汎用)
+#define PS4_MAC_ADDRESS "aa:bb:cc:dd:ee:ff"
 
 // ---------------------------------------------------------------------------
 // 輪のインデックス（固定順序）
@@ -123,12 +123,12 @@ constexpr uint8_t MOTOR_IN2[WHEEL_COUNT] = {
 // 使用 GPIO: 旧 BL/BR IN ピン (17,18,19,21) と 旧 I2C ピン (25,26) を転用。
 // ---------------------------------------------------------------------------
 constexpr uint8_t SERVO_PIN[WHEEL_COUNT] = {
-  14, // FL サーボ GPIO
-  27, // FR サーボ GPIO
-  26, // ML サーボ GPIO
-  25, // MR サーボ GPIO
-  33, // BL サーボ GPIO
-  32  // BR サーボ GPIO
+  32, // FL サーボ GPIO
+  33, // FR サーボ GPIO
+  25, // ML サーボ GPIO
+  26, // MR サーボ GPIO
+  27, // BL サーボ GPIO
+  14  // BR サーボ GPIO
 };
 
 constexpr uint16_t SERVO_PWM_FREQ = 50;   // Hz（DS3235 標準）
@@ -139,8 +139,12 @@ constexpr uint16_t SERVO_MIN_US = 500;
 constexpr uint16_t SERVO_MAX_US = 2500;
 
 // 各輪のキャリブレーション。TRIM は機械的ゼロ点の微調整。
+// 足の軸の外周が何mmズレているかを測る。時計回りにズレている場合は負とする
+constexpr float SERVO_TRIM_MM[WHEEL_COUNT] = { -0.7f, -1.5f, -1.7f, -1.0f, -1.6f, -1.3f };
+// TRIM を mm → deg に変換するための係数。
+// 外形の直径が26mmかつ、ギア比が2倍なのでこの値になる
+constexpr float SERVO_TRIM_MM_TO_DEG = 2.2f;
 // REVERSED はサーボホーンが逆向きに取り付けられている輪を反転する。
-constexpr float SERVO_TRIM_DEG[WHEEL_COUNT] = { 0, 0, 0, 0, 0, 0 };
 constexpr bool  SERVO_REVERSED[WHEEL_COUNT] = {
   false, false, false, false, false, false
 };

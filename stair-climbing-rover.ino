@@ -19,12 +19,20 @@
 // 必要ライブラリ（Arduino Library Manager でインストール）:
 //   * PS4-esp32  (aed3)
 //
-// 操作方法:
+// 操作方法（モード共通）:
+//   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
+//   Options         : 全ステアを 0° にリセンター
+//   Share           : 操作モード切替
+//
+// [通常モード（デフォルト）]
 //   左スティック Y  : 前進 / 後退
 //   左スティック X  : 左右並進（カニ歩き）
 //   右スティック X  : 旋回
-//   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
-//   Options         : 全ステアを 0° にリセンター
+//
+// [タンクモード]
+//   左スティック Y  : 左タイヤ（FL/ML/BL）正転 / 逆転
+//   右スティック Y  : 右タイヤ（FR/MR/BR）正転 / 逆転
+//   全サーボ        : 常に 0°
 
 #include <PS4Controller.h>
 
@@ -47,7 +55,18 @@ static const KinLimits kLimits = {
     MAX_LINEAR_SPEED, MAX_ANGULAR_SPEED_DEG, STICK_DEADZONE
 };
 
-static bool prevOptions = false;   // Options ボタンのエッジ検出用
+// ---------------------------------------------------------------------------
+// 操作モード
+// ---------------------------------------------------------------------------
+enum DriveMode : uint8_t {
+  MODE_NORMAL = 0,  // デフォルト: パターンB 広角ステア
+  MODE_TANK   = 1   // タンク: 左右スティック Y で左右タイヤ独立制御、全サーボ 0°
+};
+
+static DriveMode driveMode   = MODE_NORMAL;
+static bool prevOptions  = false;  // Options ボタンのエッジ検出用
+static bool prevShare    = false;  // Share ボタンのエッジ検出用
+static bool wasConnected = false;  // 接続エッジ検出用（接続時に LED 色を設定するため）
 static unsigned long lastUpdateMs = 0;
 
 // ---------------------------------------------------------------------------
@@ -108,12 +127,19 @@ void setupServos() {
 // メインループ
 // ---------------------------------------------------------------------------
 void loop() {
-  if (!PS4.isConnected()) {
+  bool connected = PS4.isConnected();
+  if (!connected) {
     stopAllMotors();           // フェイルセーフ: 駆動を停止、ステアは保持
     Serial.println("DS4 接続待ち...");
+    wasConnected = false;
     delay(100);
     lastUpdateMs = millis();   // 再接続後に dt が大きくなるのを防ぐ
     return;
+  }
+  // 接続直後（立ち上がりエッジ）に現在モードの LED 色を設定する
+  if (!wasConnected) {
+    applyModeColor();
+    wasConnected = true;
   }
 
   unsigned long now = millis();
@@ -134,6 +160,15 @@ void loop() {
   bool options = PS4.Options();
   if (options && !prevOptions) recenterSteering();
   prevOptions = options;
+
+  // Share ボタン: 操作モード切替（立ち上がりエッジのみ）
+  bool share = PS4.Share();
+  if (share && !prevShare) {
+    driveMode = (driveMode == MODE_NORMAL) ? MODE_TANK : MODE_NORMAL;
+    Serial.printf("モード切替: %s\n", driveMode == MODE_NORMAL ? "通常（広角ステア）" : "タンク（左右独立）");
+    applyModeColor();
+  }
+  prevShare = share;
 
   // --- デバッグ出力（問題解析中のみ。確認後は #if 0 で無効化）-----------
 #if 1
@@ -194,9 +229,13 @@ void loop() {
 
   // --- 運動学 → 駆動 -------------------------------------------------------
   if (!wireTestHandled) {
-    BodyTwist twist =
-        rover::mapSticks(leftX, leftY, rightX, rightY, kLimits, speedScale);
-    updateWheels(twist, dt);
+    if (driveMode == MODE_TANK) {
+      updateTankMode(leftY, rightY, speedScale);
+    } else {
+      BodyTwist twist =
+          rover::mapSticks(leftX, leftY, rightX, rightY, kLimits, speedScale);
+      updateWheels(twist, dt);
+    }
   }
 
   delay(CONTROL_PERIOD_MS);
@@ -267,6 +306,45 @@ void updateWheels(const BodyTwist& command, float dt) {
   applyDrive(W_MR, driveOut[W_MR]);
 }
 
+// ---------------------------------------------------------------------------
+// タンクモード更新
+// 左スティック Y → 左タイヤ全輪（FL/ML/BL）、右スティック Y → 右タイヤ全輪（FR/MR/BR）。
+// 全サーボは 0° に固定。BL/BR は FL/FR と共用ピンのため FL/FR への書き込みで兼用。
+// ---------------------------------------------------------------------------
+static float tankDeadzone1D(float v) {
+  float a = fabsf(v);
+  if (a < STICK_DEADZONE) return 0.0f;
+  float scaled = (a - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+  return (v > 0.0f ? 1.0f : -1.0f) * rover::kinClamp(scaled, 0.0f, 1.0f);
+}
+
+void updateTankMode(float leftY, float rightY, float speedScale) {
+  for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
+    currentSteerDeg[i] = 0.0f;
+    applySteer(i, 0.0f);
+  }
+
+  float leftSpeed  = tankDeadzone1D(leftY)  * MAX_WHEEL_SPEED_MPS * speedScale;
+  float rightSpeed = tankDeadzone1D(rightY) * MAX_WHEEL_SPEED_MPS * speedScale;
+
+  applyDrive(W_FL, leftSpeed);   // FL + BL（共用ピン）
+  applyDrive(W_ML, leftSpeed);
+  applyDrive(W_FR, rightSpeed);  // FR + BR（共用ピン）
+  applyDrive(W_MR, rightSpeed);
+}
+
+// ---------------------------------------------------------------------------
+// コントローラー LED 色: 通常モード = 青 (0,0,255) / タンクモード = 黄 (255,200,0)
+// ---------------------------------------------------------------------------
+void applyModeColor() {
+  if (driveMode == MODE_NORMAL) {
+    PS4.setLed(0, 0, 255);
+  } else {
+    PS4.setLed(255, 200, 0);
+  }
+  PS4.sendToController();
+}
+
 void recenterSteering() {
   for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
     currentSteerDeg[i] = 0.0f;
@@ -288,7 +366,7 @@ void applySteer(uint8_t wheel, float outputDeg) {
 
   float servoDeg = outputDeg * 0.5f + 90.0f;          // ギア変換 + センタリング
   if (SERVO_REVERSED[wheel]) servoDeg = 180.0f - servoDeg;
-  servoDeg += SERVO_TRIM_DEG[wheel];
+  servoDeg += SERVO_TRIM_MM[wheel] * SERVO_TRIM_MM_TO_DEG;
   servoDeg = rover::kinClamp(servoDeg, 0.0f, 180.0f);
 
   uint16_t us = (uint16_t)(SERVO_MIN_US +
