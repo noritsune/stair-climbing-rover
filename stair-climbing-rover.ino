@@ -247,6 +247,17 @@ void updateWheels(const BodyTwist& command, float dt) {
   // パターンB は 2:1 ワイドレンジギア相当のため、スルーレートを 2 倍にする。
   float maxStep = STEER_RATE_DEG_PER_SEC * dt * 2.0f;
 
+  // その場旋回（並進ゼロ・ヨーのみ）の判定。
+  // 通常のフリップ最適化は「現在のサーボ角から近い方」を各輪独立に選ぶため、
+  // FL/BL・FR/BR（共用モーターで drive を平均）でフリップ判断が食い違うと、
+  // ドライブ符号が逆になり平均が打ち消し合って旋回しない現象が起きる。
+  // その場旋回時は現在角に依存しない正準形（後述）に切り替えてこれを防ぐ。
+  constexpr float SPIN_LINEAR_EPS = 1e-3f;  // m/s
+  constexpr float SPIN_YAW_EPS    = 1e-3f;  // deg/s
+  bool pureSpin = fabsf(command.forward)    < SPIN_LINEAR_EPS
+               && fabsf(command.right)      < SPIN_LINEAR_EPS
+               && fabsf(command.yawRateDeg) > SPIN_YAW_EPS;
+
   // --- ステア更新 + 各輪のドライブ速度を計算 --------------------------------
   float driveOut[WHEEL_COUNT];
   for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
@@ -254,13 +265,30 @@ void updateWheels(const BodyTwist& command, float dt) {
         WHEEL_POS_X[i], WHEEL_POS_Y[i], command,
         currentSteerDeg[i], MAX_STEER_DEG);
 
-    // 逆転フリップ最適化: 目標まで 90° 超回す必要があるとき、
-    // モーターを逆転して目標±180° を狙えば移動量が 90° 未満に収まる。
-    float directTravel = fabsf(rover::kinDeltaAngle(currentSteerDeg[i], target.steerDeg));
-    if (directTravel > 90.0f) {
-      float flipSteer = target.steerDeg >= 0.0f
-                            ? target.steerDeg - 180.0f
-                            : target.steerDeg + 180.0f;
+    // フリップ先（目標±180°、必ず鋭角側 = |flipSteer| < 90° になる）。
+    float flipSteer = target.steerDeg >= 0.0f
+                          ? target.steerDeg - 180.0f
+                          : target.steerDeg + 180.0f;
+
+    // 逆転フリップ最適化。
+    bool flip;
+    if (pureSpin) {
+      // その場旋回: 現在角を無視し、常に鋭角表現（|目標| > 90° なら反転）へ畳む。
+      // 目標角のみで決まるため向きは毎回同一。かつ左右各ペアのドライブ符号が
+      // 必ず一致するので、共用モーターの平均が打ち消し合わない。
+      flip = fabsf(target.steerDeg) > 90.0f;
+    } else {
+      // 通常走行: 目標まで 90° 超回す必要があるとき、モーターを逆転して
+      // 目標±180° を狙えば移動量が 90° 未満に収まる。
+      // サーボは ±180° 端点を物理的に越えられないため、kinDeltaAngle（最短巻き回り角）
+      // ではなく線形距離で比較し、フリップ先が本当に近い場合のみ適用する。
+      // （±180° 付近では巻き回り経路の方が短く見えても物理的には大回りになる）
+      float directTravel = fabsf(rover::kinDeltaAngle(currentSteerDeg[i], target.steerDeg));
+      flip = directTravel > 90.0f
+          && fabsf(flipSteer - currentSteerDeg[i]) < fabsf(target.steerDeg - currentSteerDeg[i]);
+    }
+
+    if (flip) {
       target.steerDeg   = flipSteer;
       target.driveSpeed = -target.driveSpeed;
     }
