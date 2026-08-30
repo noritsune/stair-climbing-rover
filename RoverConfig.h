@@ -150,6 +150,50 @@ constexpr bool  SERVO_REVERSED[WHEEL_COUNT] = {
 };
 
 // ---------------------------------------------------------------------------
+// 目玉サーボ（左右 / 上下 / まぶた、ledc ×3）
+//
+// ステアリングサーボと違いギアを介さない直結のため、可動角 = サーボ角そのもの。
+// センター（90°）を 0° として ±EYE_MAX_DEG の範囲で動かす。
+// ---------------------------------------------------------------------------
+enum EyeAxis : uint8_t {
+  EYE_PAN  = 0,  // 左右（+ = 右）
+  EYE_TILT = 1,  // 上下（+ = 上）
+  EYE_LID  = 2,  // まぶた（+ = 開、- = 閉）
+  EYE_COUNT = 3
+};
+
+static const char* const EYE_LABELS[EYE_COUNT] = { "PAN", "TILT", "LID" };
+
+// 使用 GPIO: 走行モーター/ステアサーボで未使用のピンを割り当て。
+// 13/15 は汎用、5 はストラッピングピン（起動時 HIGH 必須）だが内部プルアップ済みのため使用可。
+constexpr uint8_t EYE_SERVO_PIN[EYE_COUNT] = {
+  13, // 左右   (PAN)
+  15, // 上下   (TILT)
+   5  // まぶた (LID)
+};
+
+// 各軸の可動範囲（センターから ±この角度）。
+constexpr float EYE_MAX_DEG = 30.0f;
+
+// 十字キー押下中の左右／上下の移動速度（deg/s）。
+constexpr float EYE_RATE_DEG_PER_SEC = 60.0f;
+
+// 十字キーを離してからセンター（0°）へ自動復帰する速度（deg/s）。
+constexpr float EYE_RETURN_RATE_DEG_PER_SEC = 60.0f;
+
+// まぶた: L2 未押下 = 全開 / L2 全押し = 全閉。
+constexpr float EYELID_OPEN_DEG   = +EYE_MAX_DEG;
+constexpr float EYELID_CLOSED_DEG = -EYE_MAX_DEG;
+
+// DS4 アナログトリガー（L2/R2）の最大値。PS4-esp32 は 0..255 を返す。
+constexpr float PS4_TRIGGER_MAX = 255.0f;
+
+// 機械的ゼロ点の微調整（度）。
+constexpr float EYE_TRIM_DEG[EYE_COUNT] = { 0.0f, 0.0f, 0.0f };
+// サーボホーンが逆向きに付いている軸を反転する。
+constexpr bool EYE_SERVO_REVERSED[EYE_COUNT] = { false, false, false };
+
+// ---------------------------------------------------------------------------
 // 制御ループ
 // ---------------------------------------------------------------------------
 constexpr uint16_t CONTROL_PERIOD_MS = 20;  // ~50 Hz

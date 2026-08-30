@@ -21,8 +21,11 @@
 //
 // 操作方法（モード共通）:
 //   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
-//   Options         : 全ステアを 0° にリセンター
+//   Options         : 全ステア + 目玉（左右/上下）を 0° にリセンター
 //   Share           : 操作モード切替
+//   十字キー        : 目玉の左右 / 上下（±30°。離すとセンターへ自動復帰）
+//   L2（アナログ）  : まぶた開閉（離す = 全開 / 全押し = 全閉、押し込み量に比例）
+//   L1（押しっぱなし）+ 十字/△✕○□ : 配線確認モード（下記）
 //
 // [通常モード（デフォルト）]
 //   左スティック Y  : 前進 / 後退
@@ -51,6 +54,9 @@ using rover::KinLimits;
 // スルーレート制限はここで行い、実際に向いている角度をドライブゲートにも使う。
 static float currentSteerDeg[WHEEL_COUNT] = { 0, 0, 0, 0, 0, 0 };
 
+// 目玉サーボの出力角（度、±EYE_MAX_DEG）。まぶたは起動時に全開。
+static float currentEyeDeg[EYE_COUNT] = { 0.0f, 0.0f, EYELID_OPEN_DEG };
+
 static const KinLimits kLimits = {
     MAX_LINEAR_SPEED, MAX_ANGULAR_SPEED_DEG, STICK_DEADZONE
 };
@@ -78,6 +84,7 @@ void setup() {
 
   setupMotors();
   setupServos();
+  setupEyeServos();
 
   PS4.begin(PS4_MAC_ADDRESS);
   Serial.print("DS4 ペアリング MAC: ");
@@ -123,6 +130,20 @@ void setupServos() {
   }
 }
 
+void setupEyeServos() {
+  for (uint8_t i = 0; i < EYE_COUNT; i++) {
+    bool ok = ledcAttach(EYE_SERVO_PIN[i], SERVO_PWM_FREQ, SERVO_PWM_BITS);
+    Serial.printf("[Eye] %s  GPIO%d(%s)\n",
+      EYE_LABELS[i], EYE_SERVO_PIN[i], ok ? "OK" : "NG");
+  }
+
+  // 起動時: 視線はセンター、まぶたは全開。
+  currentEyeDeg[EYE_PAN]  = 0.0f;
+  currentEyeDeg[EYE_TILT] = 0.0f;
+  currentEyeDeg[EYE_LID]  = EYELID_OPEN_DEG;
+  for (uint8_t i = 0; i < EYE_COUNT; i++) applyEye(i, currentEyeDeg[i]);
+}
+
 // ---------------------------------------------------------------------------
 // メインループ
 // ---------------------------------------------------------------------------
@@ -156,9 +177,15 @@ void loop() {
   float rightY = normStick(PS4.RStickY());
   float speedScale = PS4.R1() ? BOOST_MULTIPLIER : 0.7f;
 
-  // Options ボタン: 全ステアを 0° にリセンター（立ち上がりエッジのみ）
+  // L1 押下中は配線確認モード。十字キーの取り合いを避けるため目玉の左右/上下は止める。
+  bool wireTestMode = PS4.L1();
+
+  // Options ボタン: 全ステアと視線を 0° にリセンター（立ち上がりエッジのみ）
   bool options = PS4.Options();
-  if (options && !prevOptions) recenterSteering();
+  if (options && !prevOptions) {
+    recenterSteering();
+    recenterEyes();
+  }
   prevOptions = options;
 
   // Share ボタン: 操作モード切替（立ち上がりエッジのみ）
@@ -180,17 +207,20 @@ void loop() {
   }
 #endif
 
-  // --- 配線確認モード（スティック中立時にボタンで個別輪を回転、複数同時対応）---
-  // 十字上 : FL+BL 正転   十字下 : FL+BL 逆転
-  // 十字左 : ML   正転   十字右 : ML   逆転
-  // △     : FR+BR 正転   ✕     : FR+BR 逆転
-  // ○     : MR   正転   □     : MR   逆転
-  // ボタン押下中: 全サーボを 0° に固定 / 全力駆動
+  // --- 目玉サーボ更新（走行モードや配線確認モードに関わらず毎周期） --------
+  updateEyes(dt, wireTestMode);
+
+  // --- 配線確認モード（L1 押下 + スティック中立時に個別輪を回転、複数同時対応）---
+  // L1 + 十字上 : FL+BL 正転   L1 + 十字下 : FL+BL 逆転
+  // L1 + 十字左 : ML   正転   L1 + 十字右 : ML   逆転
+  // L1 + △     : FR+BR 正転   L1 + ✕     : FR+BR 逆転
+  // L1 + ○     : MR   正転   L1 + □     : MR   逆転
+  // ボタン押下中: 全ステアサーボを 0° に固定 / 全力駆動
   bool sticksNeutral = (fabsf(leftX) < STICK_DEADZONE
                      && fabsf(leftY) < STICK_DEADZONE
                      && fabsf(rightX) < STICK_DEADZONE);
   bool wireTestHandled = false;
-  if (sticksNeutral) {
+  if (wireTestMode && sticksNeutral) {
     const float WIRE_TEST_SPEED = MAX_WHEEL_SPEED_MPS;  // 常に全力
     float flCmd = 0.0f, mlCmd = 0.0f, frCmd = 0.0f, mrCmd = 0.0f;
 
@@ -379,6 +409,51 @@ void recenterSteering() {
   Serial.println("全ステアを 0° にリセンター");
 }
 
+void recenterEyes() {
+  currentEyeDeg[EYE_PAN]  = 0.0f;
+  currentEyeDeg[EYE_TILT] = 0.0f;
+  applyEye(EYE_PAN,  currentEyeDeg[EYE_PAN]);
+  applyEye(EYE_TILT, currentEyeDeg[EYE_TILT]);
+  Serial.println("視線を 0° にリセンター");
+}
+
+// 十字キー入力（-1/0/+1）に応じて 1 軸を更新する。
+// 押している間は EYE_RATE_DEG_PER_SEC で ±EYE_MAX_DEG まで動き、
+// 離すと EYE_RETURN_RATE_DEG_PER_SEC でセンター（0°）へ自動復帰する。
+static float updateEyeAxis(float currentDeg, float input, float dt) {
+  if (input == 0.0f) {
+    return rover::kinMoveTowards(currentDeg, 0.0f, EYE_RETURN_RATE_DEG_PER_SEC * dt);
+  }
+  return rover::kinClamp(currentDeg + input * EYE_RATE_DEG_PER_SEC * dt,
+                         -EYE_MAX_DEG, EYE_MAX_DEG);
+}
+
+// ---------------------------------------------------------------------------
+// 目玉サーボ更新
+// 左右/上下: 十字キー押下中だけ動き、離すとセンターへ自動復帰する（updateEyeAxis）。
+// まぶた   : L2 のアナログ押し込み量に比例（0 = 全開、最大 = 全閉）。
+// suppressGaze が true（配線確認モード中）のときは十字キー入力を無視する。
+//            この間も入力なし扱いでセンターへ復帰する。
+// ---------------------------------------------------------------------------
+void updateEyes(float dt, bool suppressGaze) {
+  float panInput  = 0.0f;
+  float tiltInput = 0.0f;
+  if (!suppressGaze) {
+    panInput  = (PS4.Right() ? 1.0f : 0.0f) - (PS4.Left() ? 1.0f : 0.0f);
+    tiltInput = (PS4.Up()    ? 1.0f : 0.0f) - (PS4.Down() ? 1.0f : 0.0f);
+  }
+
+  currentEyeDeg[EYE_PAN]  = updateEyeAxis(currentEyeDeg[EYE_PAN],  panInput,  dt);
+  currentEyeDeg[EYE_TILT] = updateEyeAxis(currentEyeDeg[EYE_TILT], tiltInput, dt);
+
+  // L2Value() は 0..255。0 = 全開、255 = 全閉へ線形補間する。
+  float lidRatio = rover::kinClamp(PS4.L2Value() / PS4_TRIGGER_MAX, 0.0f, 1.0f);
+  currentEyeDeg[EYE_LID] =
+      EYELID_OPEN_DEG + (EYELID_CLOSED_DEG - EYELID_OPEN_DEG) * lidRatio;
+
+  for (uint8_t i = 0; i < EYE_COUNT; i++) applyEye(i, currentEyeDeg[i]);
+}
+
 // ---------------------------------------------------------------------------
 // ハードウェア出力: ステアリングサーボ（DS3235 GPIO 直結、ledc）
 // ---------------------------------------------------------------------------
@@ -392,7 +467,27 @@ void applySteer(uint8_t wheel, float outputDeg) {
 
   float servoDeg = outputDeg * 0.5f + 90.0f;          // ギア変換 + センタリング
   if (SERVO_REVERSED[wheel]) servoDeg = 180.0f - servoDeg;
-  servoDeg += SERVO_TRIM_MM[wheel] * SERVO_TRIM_MM_TO_DEG;
+  servoDeg += SERVO_TRIM_MM[wheel] * SERVO_TRIM_MM_TO_DEG;  // キャリブレーションオフセット
+
+  writeServoAngle(SERVO_PIN[wheel], servoDeg);
+}
+
+// ---------------------------------------------------------------------------
+// ハードウェア出力: 目玉サーボ（GPIO 直結、ledc）
+// ---------------------------------------------------------------------------
+// outputDeg はセンターからの角度（±EYE_MAX_DEG）。ギアなし直結なので servo = outputDeg + 90。
+void applyEye(uint8_t axis, float outputDeg) {
+  outputDeg = rover::kinClamp(outputDeg, -EYE_MAX_DEG, EYE_MAX_DEG);
+
+  float servoDeg = outputDeg + 90.0f;                 // センタリング
+  if (EYE_SERVO_REVERSED[axis]) servoDeg = 180.0f - servoDeg;
+  servoDeg += EYE_TRIM_DEG[axis];                     // キャリブレーションオフセット
+
+  writeServoAngle(EYE_SERVO_PIN[axis], servoDeg);
+}
+
+// サーボ角（0..180°）を ledc デューティに変換して出力する。
+void writeServoAngle(uint8_t pin, float servoDeg) {
   servoDeg = rover::kinClamp(servoDeg, 0.0f, 180.0f);
 
   uint16_t us = (uint16_t)(SERVO_MIN_US +
@@ -402,7 +497,7 @@ void applySteer(uint8_t wheel, float outputDeg) {
   // period_us = 1,000,000 / SERVO_PWM_FREQ = 20,000 us
   constexpr uint32_t PERIOD_US = 1000000UL / SERVO_PWM_FREQ;
   uint32_t duty = (uint32_t)us * (1UL << SERVO_PWM_BITS) / PERIOD_US;
-  ledcWrite(SERVO_PIN[wheel], duty);
+  ledcWrite(pin, duty);
 }
 
 // ---------------------------------------------------------------------------
