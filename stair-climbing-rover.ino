@@ -19,23 +19,15 @@
 // 必要ライブラリ（Arduino Library Manager でインストール）:
 //   * PS4-esp32  (aed3)
 //
-// 操作方法（モード共通）:
-//   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
-//   Options         : 全ステア + 目玉（左右/上下）を 0° にリセンター
-//   Share           : 操作モード切替
-//   十字キー        : 目玉の左右 / 上下（±30°。離すとセンターへ自動復帰）
-//   L2（アナログ）  : まぶた開閉（離す = 全開 / 全押し = 全閉、押し込み量に比例）
-//   L1（押しっぱなし）+ 十字/△✕○□ : 配線確認モード（下記）
-//
-// [通常モード（デフォルト）]
+// 操作方法:
 //   左スティック Y  : 前進 / 後退
 //   左スティック X  : 左右並進（カニ歩き）
 //   右スティック X  : 旋回
-//
-// [タンクモード]
-//   左スティック Y  : 左タイヤ（FL/ML/BL）正転 / 逆転
-//   右スティック Y  : 右タイヤ（FR/MR/BR）正転 / 逆転
-//   全サーボ        : 常に 0°
+//   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
+//   Options         : 全ステア + 目玉（左右/上下）を 0° にリセンター
+//   十字キー        : 目玉の左右 / 上下（±30°。離すとセンターへ自動復帰）
+//   L2（アナログ）  : まぶた開閉（離す = 全開 / 全押し = 全閉、押し込み量に比例）
+//   L1（押しっぱなし）+ 十字/△✕○□ : 配線確認モード（下記）
 
 #include <PS4Controller.h>
 
@@ -61,17 +53,7 @@ static const KinLimits kLimits = {
     MAX_LINEAR_SPEED, MAX_ANGULAR_SPEED_DEG, STICK_DEADZONE
 };
 
-// ---------------------------------------------------------------------------
-// 操作モード
-// ---------------------------------------------------------------------------
-enum DriveMode : uint8_t {
-  MODE_NORMAL = 0,  // デフォルト: パターンB 広角ステア
-  MODE_TANK   = 1   // タンク: 左右スティック Y で左右タイヤ独立制御、全サーボ 0°
-};
-
-static DriveMode driveMode   = MODE_NORMAL;
 static bool prevOptions  = false;  // Options ボタンのエッジ検出用
-static bool prevShare    = false;  // Share ボタンのエッジ検出用
 static bool wasConnected = false;  // 接続エッジ検出用（接続時に LED 色を設定するため）
 static unsigned long lastUpdateMs = 0;
 
@@ -157,9 +139,9 @@ void loop() {
     lastUpdateMs = millis();   // 再接続後に dt が大きくなるのを防ぐ
     return;
   }
-  // 接続直後（立ち上がりエッジ）に現在モードの LED 色を設定する
+  // 接続直後（立ち上がりエッジ）に LED 色を設定する
   if (!wasConnected) {
-    applyModeColor();
+    applyLedColor();
     wasConnected = true;
   }
 
@@ -187,15 +169,6 @@ void loop() {
     recenterEyes();
   }
   prevOptions = options;
-
-  // Share ボタン: 操作モード切替（立ち上がりエッジのみ）
-  bool share = PS4.Share();
-  if (share && !prevShare) {
-    driveMode = (driveMode == MODE_NORMAL) ? MODE_TANK : MODE_NORMAL;
-    Serial.printf("モード切替: %s\n", driveMode == MODE_NORMAL ? "通常（広角ステア）" : "タンク（左右独立）");
-    applyModeColor();
-  }
-  prevShare = share;
 
   // --- デバッグ出力（問題解析中のみ。確認後は #if 0 で無効化）-----------
 #if 1
@@ -257,13 +230,9 @@ void loop() {
 
   // --- 運動学 → 駆動 -------------------------------------------------------
   if (!wireTestHandled) {
-    if (driveMode == MODE_TANK) {
-      updateTankMode(leftY, rightY, speedScale);
-    } else {
-      BodyTwist twist =
-          rover::mapSticks(leftX, leftY, rightX, rightY, kLimits, speedScale);
-      updateWheels(twist, dt);
-    }
+    BodyTwist twist =
+        rover::mapSticks(leftX, leftY, rightX, rightY, kLimits, speedScale);
+    updateWheels(twist, dt);
   }
 
   delay(CONTROL_PERIOD_MS);
@@ -363,41 +332,10 @@ void updateWheels(const BodyTwist& command, float dt) {
 }
 
 // ---------------------------------------------------------------------------
-// タンクモード更新
-// 左スティック Y → 左タイヤ全輪（FL/ML/BL）、右スティック Y → 右タイヤ全輪（FR/MR/BR）。
-// 全サーボは 0° に固定。BL/BR は FL/FR と共用ピンのため FL/FR への書き込みで兼用。
+// コントローラー LED 色（接続時に設定）: 青 (0,0,255)
 // ---------------------------------------------------------------------------
-static float tankDeadzone1D(float v) {
-  float a = fabsf(v);
-  if (a < STICK_DEADZONE) return 0.0f;
-  float scaled = (a - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
-  return (v > 0.0f ? 1.0f : -1.0f) * rover::kinClamp(scaled, 0.0f, 1.0f);
-}
-
-void updateTankMode(float leftY, float rightY, float speedScale) {
-  for (uint8_t i = 0; i < WHEEL_COUNT; i++) {
-    currentSteerDeg[i] = 0.0f;
-    applySteer(i, 0.0f);
-  }
-
-  float leftSpeed  = tankDeadzone1D(leftY)  * MAX_WHEEL_SPEED_MPS * speedScale;
-  float rightSpeed = tankDeadzone1D(rightY) * MAX_WHEEL_SPEED_MPS * speedScale;
-
-  applyDrive(W_FL, leftSpeed);   // FL + BL（共用ピン）
-  applyDrive(W_ML, leftSpeed);
-  applyDrive(W_FR, rightSpeed);  // FR + BR（共用ピン）
-  applyDrive(W_MR, rightSpeed);
-}
-
-// ---------------------------------------------------------------------------
-// コントローラー LED 色: 通常モード = 青 (0,0,255) / タンクモード = 黄 (255,200,0)
-// ---------------------------------------------------------------------------
-void applyModeColor() {
-  if (driveMode == MODE_NORMAL) {
-    PS4.setLed(0, 0, 255);
-  } else {
-    PS4.setLed(255, 200, 0);
-  }
+void applyLedColor() {
+  PS4.setLed(0, 0, 255);
   PS4.sendToController();
 }
 
