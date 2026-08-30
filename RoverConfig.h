@@ -153,7 +153,7 @@ constexpr bool  SERVO_REVERSED[WHEEL_COUNT] = {
 // 目玉サーボ（左右 / 上下 / まぶた、ledc ×3）
 //
 // ステアリングサーボと違いギアを介さない直結のため、可動角 = サーボ角そのもの。
-// センター（90°）を 0° として ±EYE_MAX_DEG の範囲で動かす。
+// センター（90°）を 0° として EYE_MIN/MAX_OUTPUT_DEG[] の範囲で動かす。
 // ---------------------------------------------------------------------------
 enum EyeAxis : uint8_t {
   EYE_PAN  = 0,  // 左右（+ = 右）
@@ -172,24 +172,39 @@ constexpr uint8_t EYE_SERVO_PIN[EYE_COUNT] = {
    5  // まぶた (LID)
 };
 
-// 各軸の可動範囲（センターから ±この角度）。
-constexpr float EYE_MAX_DEG = 30.0f;
+// 目玉サーボは LEDC ではなく RMT で駆動する。
+// ESP32 の LEDC は最大 16 チャンネルしかなく、走行モーター 8 本
+// （FL/FR/ML/MR の IN1+IN2。BL/BR は FL/FR と共用）＋ ステアサーボ 6 本 = 14 を
+// 消費するため、目玉 3 本を足すと 17 本となり最後の 1 本（まぶた）の
+// ledcAttach が必ず失敗していた（トリガーを押してもまぶたが動かない原因）。
+// RMT は別ペリフェラル（TX 8 チャンネル）なので競合しない。
+constexpr uint32_t EYE_RMT_TICK_HZ  = 1000000;  // 1 tick = 1 us（RMT は 312.5kHz〜80MHz）
+constexpr uint16_t SERVO_PERIOD_US  = 20000;    // 50 Hz
 
 // 十字キー押下中の左右／上下の移動速度（deg/s）。
-constexpr float EYE_RATE_DEG_PER_SEC = 60.0f;
+constexpr float EYE_RATE_DEG_PER_SEC = 360.0f;
 
 // 十字キーを離してからセンター（0°）へ自動復帰する速度（deg/s）。
-constexpr float EYE_RETURN_RATE_DEG_PER_SEC = 60.0f;
+constexpr float EYE_RETURN_RATE_DEG_PER_SEC = 180.0f;
 
-// まぶた: L2 未押下 = 全開 / L2 全押し = 全閉。
-constexpr float EYELID_OPEN_DEG   = +EYE_MAX_DEG;
-constexpr float EYELID_CLOSED_DEG = -EYE_MAX_DEG;
+// まぶた: R2 未押下 = 全開 / R2 全押し = 全閉。
+constexpr float EYELID_OPEN_DEG   = -45.0f;
+constexpr float EYELID_CLOSED_DEG = +30.0f;
+
+// 軸ごとの出力角リミット（applyEye のクランプ用）。
+// まぶたは PAN/TILT と可動範囲が異なるため、共通の ±MAX ではなく軸ごとに持つ。
+constexpr float EYE_MIN_OUTPUT_DEG[EYE_COUNT] = {
+  -30.0f, -20.0f, EYELID_OPEN_DEG
+};
+constexpr float EYE_MAX_OUTPUT_DEG[EYE_COUNT] = {
+  +30.0f, +40.0f, EYELID_CLOSED_DEG
+};
 
 // DS4 アナログトリガー（L2/R2）の最大値。PS4-esp32 は 0..255 を返す。
 constexpr float PS4_TRIGGER_MAX = 255.0f;
 
 // 機械的ゼロ点の微調整（度）。
-constexpr float EYE_TRIM_DEG[EYE_COUNT] = { 0.0f, 0.0f, 0.0f };
+constexpr float EYE_TRIM_DEG[EYE_COUNT] = { 3.0f, 3.0f, 0.0f };
 // サーボホーンが逆向きに付いている軸を反転する。
 constexpr bool EYE_SERVO_REVERSED[EYE_COUNT] = { false, false, false };
 

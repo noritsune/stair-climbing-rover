@@ -25,8 +25,8 @@
 //   右スティック X  : 旋回
 //   R1（押しっぱなし）: ブースト（離すと 0.7 倍）
 //   Options         : 全ステア + 目玉（左右/上下）を 0° にリセンター
-//   十字キー        : 目玉の左右 / 上下（±30°。離すとセンターへ自動復帰）
-//   L2（アナログ）  : まぶた開閉（離す = 全開 / 全押し = 全閉、押し込み量に比例）
+//   十字キー        : 目玉の左右 / 上下（斜め可。離すとセンターへ自動復帰）
+//   R2（アナログ）  : まぶた開閉（離す = 全開 / 全押し = 全閉、押し込み量に比例）
 //   L1（押しっぱなし）+ 十字/△✕○□ : 配線確認モード（下記）
 
 #include <PS4Controller.h>
@@ -46,7 +46,7 @@ using rover::KinLimits;
 // スルーレート制限はここで行い、実際に向いている角度をドライブゲートにも使う。
 static float currentSteerDeg[WHEEL_COUNT] = { 0, 0, 0, 0, 0, 0 };
 
-// 目玉サーボの出力角（度、±EYE_MAX_DEG）。まぶたは起動時に全開。
+// 目玉サーボの出力角（度、軸ごとの可動範囲内）。まぶたは起動時に全開。
 static float currentEyeDeg[EYE_COUNT] = { 0.0f, 0.0f, EYELID_OPEN_DEG };
 
 static const KinLimits kLimits = {
@@ -112,9 +112,13 @@ void setupServos() {
   }
 }
 
+// 目玉サーボは RMT で駆動する。
+// LEDC は 16ch しかなく、走行モーター 8ch + ステアサーボ 6ch で 14ch を消費するため、
+// 目玉 3ch を足すと 17ch となり最後の 1 本（まぶた）の ledcAttach が必ず失敗していた。
 void setupEyeServos() {
   for (uint8_t i = 0; i < EYE_COUNT; i++) {
-    bool ok = ledcAttach(EYE_SERVO_PIN[i], SERVO_PWM_FREQ, SERVO_PWM_BITS);
+    bool ok = rmtInit(EYE_SERVO_PIN[i], RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, EYE_RMT_TICK_HZ);
+    if (ok) rmtSetEOT(EYE_SERVO_PIN[i], LOW);  // 送信終了後は LOW を維持
     Serial.printf("[Eye] %s  GPIO%d(%s)\n",
       EYE_LABELS[i], EYE_SERVO_PIN[i], ok ? "OK" : "NG");
   }
@@ -175,8 +179,9 @@ void loop() {
   static unsigned long dbgPrint = 0;
   if (millis() - dbgPrint > 200) {
     dbgPrint = millis();
-    Serial.printf("raw LX=%d LY=%d RX=%d RY=%d\n",
-        PS4.LStickX(), PS4.LStickY(), PS4.RStickX(), PS4.RStickY());
+    Serial.printf("raw LX=%d LY=%d RX=%d RY=%d R2=%d\n",
+        PS4.LStickX(), PS4.LStickY(), PS4.RStickX(), PS4.RStickY(),
+        PS4.R2Value());
   }
 #endif
 
@@ -356,20 +361,31 @@ void recenterEyes() {
 }
 
 // 十字キー入力（-1/0/+1）に応じて 1 軸を更新する。
-// 押している間は EYE_RATE_DEG_PER_SEC で ±EYE_MAX_DEG まで動き、
+// 押している間は EYE_RATE_DEG_PER_SEC で minDeg..maxDeg まで動き、
 // 離すと EYE_RETURN_RATE_DEG_PER_SEC でセンター（0°）へ自動復帰する。
-static float updateEyeAxis(float currentDeg, float input, float dt) {
+// 可動範囲は上下の +20°/-45° のようにセンター非対称でもよい。
+static float updateEyeAxis(float currentDeg, float input, float dt,
+                           float minDeg, float maxDeg) {
   if (input == 0.0f) {
     return rover::kinMoveTowards(currentDeg, 0.0f, EYE_RETURN_RATE_DEG_PER_SEC * dt);
   }
   return rover::kinClamp(currentDeg + input * EYE_RATE_DEG_PER_SEC * dt,
-                         -EYE_MAX_DEG, EYE_MAX_DEG);
+                         minDeg, maxDeg);
 }
+
+// DS4 の十字キーはハットスイッチのため、斜めは Up()/Right() ではなく
+// UpRight() など専用フラグで報告され、そのとき Up()/Right() は false になる。
+// 斜め入力を上下・左右それぞれの成分に展開して、両軸を同時に動かせるようにする。
+static bool isDpadUp()    { return PS4.Up()    || PS4.UpLeft()    || PS4.UpRight(); }
+static bool isDpadDown()  { return PS4.Down()  || PS4.DownLeft()  || PS4.DownRight(); }
+static bool isDpadLeft()  { return PS4.Left()  || PS4.UpLeft()    || PS4.DownLeft(); }
+static bool isDpadRight() { return PS4.Right() || PS4.UpRight()   || PS4.DownRight(); }
 
 // ---------------------------------------------------------------------------
 // 目玉サーボ更新
 // 左右/上下: 十字キー押下中だけ動き、離すとセンターへ自動復帰する（updateEyeAxis）。
-// まぶた   : L2 のアナログ押し込み量に比例（0 = 全開、最大 = 全閉）。
+//            斜め（右上など）は両軸が同時に動く。
+// まぶた   : R2 のアナログ押し込み量に比例（0 = 全開、最大 = 全閉）。
 // suppressGaze が true（配線確認モード中）のときは十字キー入力を無視する。
 //            この間も入力なし扱いでセンターへ復帰する。
 // ---------------------------------------------------------------------------
@@ -377,15 +393,19 @@ void updateEyes(float dt, bool suppressGaze) {
   float panInput  = 0.0f;
   float tiltInput = 0.0f;
   if (!suppressGaze) {
-    panInput  = (PS4.Right() ? 1.0f : 0.0f) - (PS4.Left() ? 1.0f : 0.0f);
-    tiltInput = (PS4.Up()    ? 1.0f : 0.0f) - (PS4.Down() ? 1.0f : 0.0f);
+    panInput  = (isDpadRight() ? 1.0f : 0.0f) - (isDpadLeft() ? 1.0f : 0.0f);
+    tiltInput = (isDpadUp()    ? 1.0f : 0.0f) - (isDpadDown() ? 1.0f : 0.0f);
   }
 
-  currentEyeDeg[EYE_PAN]  = updateEyeAxis(currentEyeDeg[EYE_PAN],  panInput,  dt);
-  currentEyeDeg[EYE_TILT] = updateEyeAxis(currentEyeDeg[EYE_TILT], tiltInput, dt);
+  currentEyeDeg[EYE_PAN]  = updateEyeAxis(currentEyeDeg[EYE_PAN],  panInput,  dt,
+                                          EYE_MIN_OUTPUT_DEG[EYE_PAN],
+                                          EYE_MAX_OUTPUT_DEG[EYE_PAN]);
+  currentEyeDeg[EYE_TILT] = updateEyeAxis(currentEyeDeg[EYE_TILT], tiltInput, dt,
+                                          EYE_MIN_OUTPUT_DEG[EYE_TILT],
+                                          EYE_MAX_OUTPUT_DEG[EYE_TILT]);
 
-  // L2Value() は 0..255。0 = 全開、255 = 全閉へ線形補間する。
-  float lidRatio = rover::kinClamp(PS4.L2Value() / PS4_TRIGGER_MAX, 0.0f, 1.0f);
+  // R2Value() は 0..255。0 = 全開、255 = 全閉へ線形補間する。
+  float lidRatio = rover::kinClamp(PS4.R2Value() / PS4_TRIGGER_MAX, 0.0f, 1.0f);
   currentEyeDeg[EYE_LID] =
       EYELID_OPEN_DEG + (EYELID_CLOSED_DEG - EYELID_OPEN_DEG) * lidRatio;
 
@@ -411,17 +431,41 @@ void applySteer(uint8_t wheel, float outputDeg) {
 }
 
 // ---------------------------------------------------------------------------
-// ハードウェア出力: 目玉サーボ（GPIO 直結、ledc）
+// ハードウェア出力: 目玉サーボ（GPIO 直結、RMT）
 // ---------------------------------------------------------------------------
-// outputDeg はセンターからの角度（±EYE_MAX_DEG）。ギアなし直結なので servo = outputDeg + 90。
+// outputDeg はセンターからの角度。ギアなし直結なので servo = outputDeg + 90。
+// 可動範囲は軸ごとに異なる（まぶたは PAN/TILT と別レンジ）。
 void applyEye(uint8_t axis, float outputDeg) {
-  outputDeg = rover::kinClamp(outputDeg, -EYE_MAX_DEG, EYE_MAX_DEG);
+  outputDeg = rover::kinClamp(outputDeg,
+                              EYE_MIN_OUTPUT_DEG[axis], EYE_MAX_OUTPUT_DEG[axis]);
 
   float servoDeg = outputDeg + 90.0f;                 // センタリング
   if (EYE_SERVO_REVERSED[axis]) servoDeg = 180.0f - servoDeg;
   servoDeg += EYE_TRIM_DEG[axis];                     // キャリブレーションオフセット
 
-  writeServoAngle(EYE_SERVO_PIN[axis], servoDeg);
+  writeEyeServoAngle(axis, servoDeg);
+}
+
+// サーボ角（0..180°）を RMT のループ送信に変換して出力する。
+// 1 シンボル =「HIGH を us だけ」→「LOW を 20ms - us だけ」で 50Hz のサーボ信号になる。
+// rmtWriteLooping() はチャンネルを一度リセットするため、パルス幅が実際に
+// 変化したときだけ書き込む（静止中は信号が途切れない）。
+void writeEyeServoAngle(uint8_t axis, float servoDeg) {
+  servoDeg = rover::kinClamp(servoDeg, 0.0f, 180.0f);
+
+  uint16_t us = (uint16_t)(SERVO_MIN_US +
+      (servoDeg / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US));
+
+  static uint16_t lastUs[EYE_COUNT] = { 0, 0, 0 };
+  if (us == lastUs[axis]) return;
+  lastUs[axis] = us;
+
+  rmt_data_t pulse;
+  pulse.level0    = 1;
+  pulse.duration0 = us;                       // パルス幅（500..2500us）
+  pulse.level1    = 0;
+  pulse.duration1 = SERVO_PERIOD_US - us;     // 残り（15bit = 最大32767 に収まる）
+  rmtWriteLooping(EYE_SERVO_PIN[axis], &pulse, 1);
 }
 
 // サーボ角（0..180°）を ledc デューティに変換して出力する。
