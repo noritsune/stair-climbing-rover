@@ -375,16 +375,17 @@ static float updateEyeAxis(float currentDeg, float input, float dt,
 
 // DS4 の十字キーはハットスイッチのため、斜めは Up()/Right() ではなく
 // UpRight() など専用フラグで報告され、そのとき Up()/Right() は false になる。
-// 斜め入力を上下・左右それぞれの成分に展開して、両軸を同時に動かせるようにする。
-static bool isDpadUp()    { return PS4.Up()    || PS4.UpLeft()    || PS4.UpRight(); }
-static bool isDpadDown()  { return PS4.Down()  || PS4.DownLeft()  || PS4.DownRight(); }
-static bool isDpadLeft()  { return PS4.Left()  || PS4.UpLeft()    || PS4.DownLeft(); }
-static bool isDpadRight() { return PS4.Right() || PS4.UpRight()   || PS4.DownRight(); }
+// 斜め入力は使わない方針なので、UpRight() 等は展開せず単押しのみを見る
+// （斜めに倒している間は入力なし扱いとなり、視線はセンターへ復帰する）。
+static bool isDpadUp()    { return PS4.Up(); }
+static bool isDpadDown()  { return PS4.Down(); }
+static bool isDpadLeft()  { return PS4.Left(); }
+static bool isDpadRight() { return PS4.Right(); }
 
 // ---------------------------------------------------------------------------
 // 目玉サーボ更新
 // 左右/上下: 十字キー押下中だけ動き、離すとセンターへ自動復帰する（updateEyeAxis）。
-//            斜め（右上など）は両軸が同時に動く。
+//            斜め（右上など）は受け付けず、入力なし扱いとする。
 // まぶた   : R2 のアナログ押し込み量に比例（0 = 全開、最大 = 全閉）。
 // suppressGaze が true（配線確認モード中）のときは十字キー入力を無視する。
 //            この間も入力なし扱いでセンターへ復帰する。

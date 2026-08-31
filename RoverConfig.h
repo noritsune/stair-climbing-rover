@@ -206,7 +206,8 @@ constexpr float PS4_TRIGGER_MAX = 255.0f;
 // 機械的ゼロ点の微調整（度）。
 constexpr float EYE_TRIM_DEG[EYE_COUNT] = { 3.0f, 3.0f, 0.0f };
 // サーボホーンが逆向きに付いている軸を反転する。
-constexpr bool EYE_SERVO_REVERSED[EYE_COUNT] = { false, false, false };
+// PAN は実機で十字キーの左右と目線の向きが逆になるため反転する。
+constexpr bool EYE_SERVO_REVERSED[EYE_COUNT] = { true, false, false };
 
 // ---------------------------------------------------------------------------
 // 制御ループ
