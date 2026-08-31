@@ -2,6 +2,12 @@
 // The board runs as a Wi-Fi access point. Connect a phone to the AP
 // and open http://192.168.4.1/ in a browser to view the live stream.
 //
+// Two HTTP servers run side by side:
+//   port 80  : the viewer page, /control (camera settings) and /status
+//   port 81  : /stream (MJPEG)
+// They are separate because the stream handler occupies its HTTP worker for as
+// long as a client is watching; on a single server /control would never answer.
+//
 // Board setting in Arduino IDE: "AI Thinker ESP32-CAM"
 // (Tools > Board > esp32 > AI Thinker ESP32-CAM)
 
@@ -9,11 +15,26 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
+#include "index_html.h"
+
 // ---------- Access point settings ----------
 static const char *AP_SSID = "RoverCam";
 static const char *AP_PASSWORD = "12345678";  // 8+ chars required
 static const int AP_CHANNEL = 1;
 static const int AP_MAX_CONNECTIONS = 2;
+
+// ---------- Server settings ----------
+static const int WEB_PORT = 80;
+static const int STREAM_PORT = 81;
+static const int STREAM_MAX_CLIENTS = 3;
+
+// ---------- Camera defaults and limits ----------
+static const framesize_t DEFAULT_FRAMESIZE = FRAMESIZE_VGA;  // 640x480
+static const int DEFAULT_JPEG_QUALITY = 12;  // 0-63, lower = better quality
+static const int MIN_JPEG_QUALITY = 10;      // below this the encoder can stall
+static const int MAX_JPEG_QUALITY = 63;
+static const int MAX_FPS_LIMIT = 30;
+static const int MS_PER_SECOND = 1000;
 
 // ---------- Camera pin map: AI-Thinker ESP32-CAM ----------
 #define PWDN_GPIO_NUM 32
@@ -39,32 +60,96 @@ static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
 static const char *STREAM_PART_HEADER =
     "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-static const char INDEX_HTML[] = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rover Camera</title>
-<style>
-  body { margin: 0; background: #111; color: #eee;
-         font-family: sans-serif; text-align: center; }
-  h1 { font-size: 1.2rem; padding: 0.5rem; margin: 0; }
-  img { width: 100%; max-width: 640px; height: auto; }
-</style>
-</head>
-<body>
-<h1>Rover Camera</h1>
-<img src="/stream" alt="camera stream">
-</body>
-</html>
-)rawliteral";
+static httpd_handle_t webServer = NULL;
+static httpd_handle_t streamServer = NULL;
 
-static httpd_handle_t httpServer = NULL;
+// Largest frame size the buffers were allocated for. Set once at init.
+static framesize_t maxFramesize = FRAMESIZE_VGA;
+
+// Minimum gap between frames, 0 = send as fast as the sensor delivers.
+// Written by the /control task, read by the stream task.
+static volatile uint32_t frameIntervalMs = 0;
 
 static esp_err_t indexHandler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t statusHandler(httpd_req_t *req) {
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "camera sensor unavailable");
+  }
+
+  const uint32_t interval = frameIntervalMs;
+  const int fps = interval > 0 ? MS_PER_SECOND / (int)interval : 0;
+
+  char json[160];
+  snprintf(json, sizeof(json),
+           "{\"framesize\":%d,\"quality\":%d,\"fps\":%d,"
+           "\"maxFramesize\":%d,\"streamPort\":%d}",
+           (int)sensor->status.framesize, (int)sensor->status.quality, fps,
+           (int)maxFramesize, STREAM_PORT);
+
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_sendstr(req, json);
+}
+
+// GET /control?var=<framesize|quality|fps>&val=<number>
+static esp_err_t controlHandler(httpd_req_t *req) {
+  char query[64];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "query required");
+  }
+
+  char var[16];
+  char val[16];
+  if (httpd_query_key_value(query, "var", var, sizeof(var)) != ESP_OK ||
+      httpd_query_key_value(query, "val", val, sizeof(val)) != ESP_OK) {
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                               "var and val required");
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "camera sensor unavailable");
+  }
+
+  const int value = atoi(val);
+  int result = -1;
+  if (strcmp(var, "framesize") == 0) {
+    if (value < 0 || value > (int)maxFramesize) {
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "framesize out of range");
+    }
+    result = sensor->set_framesize(sensor, (framesize_t)value);
+  } else if (strcmp(var, "quality") == 0) {
+    if (value < MIN_JPEG_QUALITY || value > MAX_JPEG_QUALITY) {
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "quality out of range");
+    }
+    result = sensor->set_quality(sensor, value);
+  } else if (strcmp(var, "fps") == 0) {
+    if (value < 0 || value > MAX_FPS_LIMIT) {
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "fps out of range");
+    }
+    frameIntervalMs = value > 0 ? MS_PER_SECOND / (uint32_t)value : 0;
+    result = 0;
+  } else {
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown var");
+  }
+
+  if (result != 0) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "camera rejected the setting");
+  }
+
+  Serial.printf("Control: %s = %d\n", var, value);
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_sendstr(req, "ok");
 }
 
 static esp_err_t streamHandler(httpd_req_t *req) {
@@ -74,9 +159,21 @@ static esp_err_t streamHandler(httpd_req_t *req) {
   }
 
   char partHeader[64];
+  uint32_t lastFrameMs = 0;
   while (true) {
+    const uint32_t interval = frameIntervalMs;
+    if (interval > 0) {
+      const uint32_t elapsed = millis() - lastFrameMs;
+      if (elapsed < interval) {
+        delay(interval - elapsed);
+      }
+    }
+    lastFrameMs = millis();
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
+      // Also happens for a frame or two right after a resolution change;
+      // the browser reconnects on its own.
       Serial.println("Camera capture failed");
       res = ESP_FAIL;
       break;
@@ -126,51 +223,89 @@ static bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
+  config.jpeg_quality = DEFAULT_JPEG_QUALITY;
 
+  // The frame buffers are sized at init, so init at the largest resolution the
+  // board can hold and step down afterwards. That is what lets /control raise
+  // the resolution later without reinitialising the driver.
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_VGA;  // 640x480
-    config.jpeg_quality = 12;           // 0-63, lower = better quality
+    maxFramesize = FRAMESIZE_UXGA;  // 1600x1200
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
-    config.frame_size = FRAMESIZE_QVGA;  // 320x240
-    config.jpeg_quality = 15;
+    maxFramesize = FRAMESIZE_QVGA;  // 320x240, all DRAM can spare
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
+  config.frame_size = maxFramesize;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) {
+    Serial.println("Camera sensor not found");
+    return false;
+  }
+  const framesize_t startSize =
+      DEFAULT_FRAMESIZE < maxFramesize ? DEFAULT_FRAMESIZE : maxFramesize;
+  sensor->set_framesize(sensor, startSize);
+  sensor->set_quality(sensor, DEFAULT_JPEG_QUALITY);
   return true;
 }
 
-static bool startHttpServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = 80;
-
-  if (httpd_start(&httpServer, &config) != ESP_OK) {
-    Serial.println("Failed to start HTTP server");
+static bool registerUri(httpd_handle_t server, const char *uri,
+                        esp_err_t (*handler)(httpd_req_t *)) {
+  httpd_uri_t definition = {
+    .uri = uri,
+    .method = HTTP_GET,
+    .handler = handler,
+    .user_ctx = NULL,
+  };
+  if (httpd_register_uri_handler(server, &definition) != ESP_OK) {
+    Serial.printf("Failed to register %s\n", uri);
     return false;
   }
-
-  httpd_uri_t indexUri = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = indexHandler,
-    .user_ctx = NULL,
-  };
-  httpd_uri_t streamUri = {
-    .uri = "/stream",
-    .method = HTTP_GET,
-    .handler = streamHandler,
-    .user_ctx = NULL,
-  };
-  httpd_register_uri_handler(httpServer, &indexUri);
-  httpd_register_uri_handler(httpServer, &streamUri);
   return true;
+}
+
+static bool startWebServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = WEB_PORT;
+
+  if (httpd_start(&webServer, &config) != ESP_OK) {
+    Serial.println("Failed to start web server");
+    return false;
+  }
+  return registerUri(webServer, "/", indexHandler) &&
+         registerUri(webServer, "/status", statusHandler) &&
+         registerUri(webServer, "/control", controlHandler);
+}
+
+static bool startStreamServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = STREAM_PORT;
+  config.ctrl_port += 1;  // must differ from the web server's control socket
+  config.max_open_sockets = STREAM_MAX_CLIENTS;
+  // A reconnecting browser can leave its previous stream socket behind;
+  // purging the least recently used one keeps a slot free for it.
+  config.lru_purge_enable = true;
+
+  if (httpd_start(&streamServer, &config) != ESP_OK) {
+    Serial.println("Failed to start stream server");
+    return false;
+  }
+  return registerUri(streamServer, "/stream", streamHandler);
+}
+
+static void halt(const char *reason) {
+  Serial.printf("Halting: %s\n", reason);
+  while (true) {
+    delay(1000);
+  }
 }
 
 void setup() {
@@ -178,26 +313,17 @@ void setup() {
   Serial.println();
 
   if (!initCamera()) {
-    Serial.println("Halting: camera not available");
-    while (true) {
-      delay(1000);
-    }
+    halt("camera not available");
   }
 
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, false,
                    AP_MAX_CONNECTIONS)) {
-    Serial.println("Halting: failed to start access point");
-    while (true) {
-      delay(1000);
-    }
+    halt("failed to start access point");
   }
 
-  if (!startHttpServer()) {
-    Serial.println("Halting: HTTP server not available");
-    while (true) {
-      delay(1000);
-    }
+  if (!startWebServer() || !startStreamServer()) {
+    halt("HTTP server not available");
   }
 
   Serial.println("Camera streamer ready");
@@ -208,6 +334,6 @@ void setup() {
 }
 
 void loop() {
-  // Everything is handled by the HTTP server task.
+  // Everything is handled by the HTTP server tasks.
   delay(1000);
 }
