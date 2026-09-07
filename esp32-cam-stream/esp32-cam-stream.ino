@@ -12,6 +12,7 @@
 // (Tools > Board > esp32 > AI Thinker ESP32-CAM)
 
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
@@ -27,6 +28,17 @@ static const int AP_MAX_CONNECTIONS = 2;
 static const int WEB_PORT = 80;
 static const int STREAM_PORT = 81;
 static const int STREAM_MAX_CLIENTS = 3;
+
+// esp_http_server runs a single worker task, so a socket that stops draining
+// (the phone walked out of range) blocks every other request on that server
+// until the send finally times out. Short socket timeouts plus TCP keep-alive
+// bound how long a client that vanished can hold the server hostage, which is
+// what makes the stream come back once the rover is in range again.
+static const uint16_t SOCKET_SEND_TIMEOUT_S = 2;
+static const uint16_t SOCKET_RECV_TIMEOUT_S = 2;
+static const int KEEP_ALIVE_IDLE_S = 3;
+static const int KEEP_ALIVE_INTERVAL_S = 1;
+static const int KEEP_ALIVE_RETRIES = 3;
 
 // ---------- Camera defaults and limits ----------
 static const framesize_t DEFAULT_FRAMESIZE = FRAMESIZE_VGA;  // 640x480
@@ -75,6 +87,30 @@ static esp_err_t indexHandler(httpd_req_t *req) {
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+// Link quality of the connected station, measured by the AP. The browser
+// cannot read its own RSSI, so this is the only signal reading available to
+// the viewer page. With one phone connected there is a single entry; the
+// strongest is reported so a stray second client cannot drag the reading down.
+static bool peakStationRssi(int8_t *rssiOut, int *clientsOut) {
+  wifi_sta_list_t stations;
+  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK) {
+    return false;
+  }
+  *clientsOut = stations.num;
+  if (stations.num <= 0) {
+    return false;
+  }
+
+  int8_t peak = stations.sta[0].rssi;
+  for (int i = 1; i < stations.num; i++) {
+    if (stations.sta[i].rssi > peak) {
+      peak = stations.sta[i].rssi;
+    }
+  }
+  *rssiOut = peak;
+  return true;
+}
+
 static esp_err_t statusHandler(httpd_req_t *req) {
   sensor_t *sensor = esp_camera_sensor_get();
   if (!sensor) {
@@ -85,12 +121,22 @@ static esp_err_t statusHandler(httpd_req_t *req) {
   const uint32_t interval = frameIntervalMs;
   const int fps = interval > 0 ? MS_PER_SECOND / (int)interval : 0;
 
-  char json[160];
+  int8_t rssi = 0;
+  int clients = 0;
+  char rssiJson[8];
+  if (peakStationRssi(&rssi, &clients)) {
+    snprintf(rssiJson, sizeof(rssiJson), "%d", (int)rssi);
+  } else {
+    strcpy(rssiJson, "null");
+  }
+
+  char json[220];
   snprintf(json, sizeof(json),
            "{\"framesize\":%d,\"quality\":%d,\"fps\":%d,"
-           "\"maxFramesize\":%d,\"streamPort\":%d}",
+           "\"maxFramesize\":%d,\"streamPort\":%d,"
+           "\"rssi\":%s,\"clients\":%d}",
            (int)sensor->status.framesize, (int)sensor->status.quality, fps,
-           (int)maxFramesize, STREAM_PORT);
+           (int)maxFramesize, STREAM_PORT, rssiJson, clients);
 
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_sendstr(req, json);
@@ -154,6 +200,14 @@ static esp_err_t controlHandler(httpd_req_t *req) {
 
 static esp_err_t streamHandler(httpd_req_t *req) {
   esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) {
+    return res;
+  }
+  // The viewer page is served from port 80 and reads this stream with fetch(),
+  // so to the browser it is a cross-origin request -- a different port is a
+  // different origin. Without this header the read is blocked. (An <img> tag
+  // would not need it, but it cannot detect a stalled stream.)
+  res = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   if (res != ESP_OK) {
     return res;
   }
@@ -272,9 +326,23 @@ static bool registerUri(httpd_handle_t server, const char *uri,
   return true;
 }
 
+// Shared by both servers: bound how long a client that stopped acknowledging
+// can occupy a socket, and let the server drop the least recently used one so
+// a reconnecting browser always finds a free slot.
+static void applyConnectionPolicy(httpd_config_t *config) {
+  config->send_wait_timeout = SOCKET_SEND_TIMEOUT_S;
+  config->recv_wait_timeout = SOCKET_RECV_TIMEOUT_S;
+  config->keep_alive_enable = true;
+  config->keep_alive_idle = KEEP_ALIVE_IDLE_S;
+  config->keep_alive_interval = KEEP_ALIVE_INTERVAL_S;
+  config->keep_alive_count = KEEP_ALIVE_RETRIES;
+  config->lru_purge_enable = true;
+}
+
 static bool startWebServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = WEB_PORT;
+  applyConnectionPolicy(&config);
 
   if (httpd_start(&webServer, &config) != ESP_OK) {
     Serial.println("Failed to start web server");
@@ -290,9 +358,7 @@ static bool startStreamServer() {
   config.server_port = STREAM_PORT;
   config.ctrl_port += 1;  // must differ from the web server's control socket
   config.max_open_sockets = STREAM_MAX_CLIENTS;
-  // A reconnecting browser can leave its previous stream socket behind;
-  // purging the least recently used one keeps a slot free for it.
-  config.lru_purge_enable = true;
+  applyConnectionPolicy(&config);
 
   if (httpd_start(&streamServer, &config) != ESP_OK) {
     Serial.println("Failed to start stream server");
@@ -321,6 +387,10 @@ void setup() {
                    AP_MAX_CONNECTIONS)) {
     halt("failed to start access point");
   }
+  // Range is the whole game here, and the board is mains/battery powered while
+  // driving, so buy every dB available: full TX power and no modem sleep.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setSleep(false);
 
   if (!startWebServer() || !startStreamServer()) {
     halt("HTTP server not available");
