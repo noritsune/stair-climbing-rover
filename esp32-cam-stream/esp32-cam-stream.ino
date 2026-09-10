@@ -24,6 +24,14 @@ static const char *AP_PASSWORD = "12345678";  // 8+ chars required
 static const int AP_CHANNEL = 1;
 static const int AP_MAX_CONNECTIONS = 2;
 
+// 802.11b only. Its lowest rates are DSSS, which a receiver can pull out of
+// roughly 10 dB more noise than the OFDM rates 11g/n fall back to -- two to
+// three times the usable distance, and the single biggest lever on range here.
+// The trade is a 11 Mbit/s PHY ceiling, still far above what the stream needs.
+// If a phone refuses to associate (a few Wi-Fi 6 clients have dropped 11b),
+// widen this to WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N.
+static const uint8_t AP_PROTOCOL_BITMAP = WIFI_PROTOCOL_11B;
+
 // ---------- Server settings ----------
 static const int WEB_PORT = 80;
 static const int STREAM_PORT = 81;
@@ -41,8 +49,13 @@ static const int KEEP_ALIVE_INTERVAL_S = 1;
 static const int KEEP_ALIVE_RETRIES = 3;
 
 // ---------- Camera defaults and limits ----------
-static const framesize_t DEFAULT_FRAMESIZE = FRAMESIZE_VGA;  // 640x480
-static const int DEFAULT_JPEG_QUALITY = 12;  // 0-63, lower = better quality
+// Range beats picture quality for a rover camera: QVGA at quality 18 and
+// 10 fps is roughly 0.5-1 Mbit/s, which an 11b link still carries at the
+// distance where a VGA stream has already stalled. All three stay adjustable
+// from the viewer page when the rover is close enough to spend the bandwidth.
+static const framesize_t DEFAULT_FRAMESIZE = FRAMESIZE_QVGA;  // 320x240
+static const int DEFAULT_JPEG_QUALITY = 18;  // 0-63, lower = better quality
+static const int DEFAULT_FPS_LIMIT = 10;
 static const int MIN_JPEG_QUALITY = 10;      // below this the encoder can stall
 static const int MAX_JPEG_QUALITY = 63;
 static const int MAX_FPS_LIMIT = 30;
@@ -80,7 +93,7 @@ static framesize_t maxFramesize = FRAMESIZE_VGA;
 
 // Minimum gap between frames, 0 = send as fast as the sensor delivers.
 // Written by the /control task, read by the stream task.
-static volatile uint32_t frameIntervalMs = 0;
+static volatile uint32_t frameIntervalMs = MS_PER_SECOND / DEFAULT_FPS_LIMIT;
 
 static esp_err_t indexHandler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
@@ -388,9 +401,17 @@ void setup() {
     halt("failed to start access point");
   }
   // Range is the whole game here, and the board is mains/battery powered while
-  // driving, so buy every dB available: full TX power and no modem sleep.
+  // driving, so buy every dB available: full TX power, no modem sleep, and the
+  // slow-but-tough 802.11b PHY.
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
+  const esp_err_t protocolErr =
+      esp_wifi_set_protocol(WIFI_IF_AP, AP_PROTOCOL_BITMAP);
+  if (protocolErr != ESP_OK) {
+    // Not fatal: the AP keeps serving on the default 11b/g/n mix, with less
+    // reach. Worth seeing on the console, so log it instead of halting.
+    Serial.printf("Failed to fix the AP to 802.11b: 0x%x\n", protocolErr);
+  }
 
   if (!startWebServer() || !startStreamServer()) {
     halt("HTTP server not available");
