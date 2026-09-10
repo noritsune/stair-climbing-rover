@@ -8,6 +8,10 @@
 // They are separate because the stream handler occupies its HTTP worker for as
 // long as a client is watching; on a single server /control would never answer.
 //
+// The access point comes up before the camera and does not depend on it: a
+// board whose camera fails to initialise still raises the AP and serves a page
+// naming the error, instead of going silent and looking like a radio fault.
+//
 // Board setting in Arduino IDE: "AI Thinker ESP32-CAM"
 // (Tools > Board > esp32 > AI Thinker ESP32-CAM)
 
@@ -16,6 +20,7 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
+#include "camera_error_html.h"
 #include "index_html.h"
 
 // ---------- Access point settings ----------
@@ -88,6 +93,13 @@ static const char *STREAM_PART_HEADER =
 static httpd_handle_t webServer = NULL;
 static httpd_handle_t streamServer = NULL;
 
+// The camera is brought up last and is allowed to fail: the AP and both HTTP
+// servers are already running by then, so a board with a dead camera still
+// answers on http://192.168.4.1/ and says what went wrong. Every camera-backed
+// endpoint checks this flag first.
+static bool isCameraReady = false;
+static esp_err_t cameraInitError = ESP_OK;
+
 // Largest frame size the buffers were allocated for. Set once at init.
 static framesize_t maxFramesize = FRAMESIZE_VGA;
 
@@ -95,8 +107,56 @@ static framesize_t maxFramesize = FRAMESIZE_VGA;
 // Written by the /control task, read by the stream task.
 static volatile uint32_t frameIntervalMs = MS_PER_SECOND / DEFAULT_FPS_LIMIT;
 
+// A serial monitor is rarely at hand out where the rover drives, so the error
+// page names the likely cause rather than only the raw code.
+static const char *cameraErrorHint(esp_err_t err) {
+  switch (err) {
+    case ESP_ERR_CAMERA_NOT_DETECTED:
+    case ESP_ERR_NOT_FOUND:
+      return "カメラを検出できません（ケーブルの抜け・逆挿しが最有力）";
+    case ESP_ERR_CAMERA_NOT_SUPPORTED:
+      return "対応していないセンサーです";
+    case ESP_ERR_NO_MEM:
+      return "メモリが足りません（PSRAM が無効の可能性）";
+    case ESP_ERR_INVALID_STATE:
+      return "ドライバの状態が不正です（電源を入れ直してください）";
+    default:
+      return "原因を特定できません（接触不良かモジュールの故障）";
+  }
+}
+
+// Sent in chunks rather than built in one buffer: the page's CSS contains '%',
+// which snprintf would read as a conversion specifier.
+static esp_err_t sendCameraErrorPage(httpd_req_t *req) {
+  char detail[128];
+  snprintf(detail, sizeof(detail), "0x%x - %s", (int)cameraInitError,
+           cameraErrorHint(cameraInitError));
+
+  esp_err_t res = httpd_resp_sendstr_chunk(req, CAMERA_ERROR_HTML_HEAD);
+  if (res == ESP_OK) {
+    res = httpd_resp_sendstr_chunk(req, detail);
+  }
+  if (res == ESP_OK) {
+    res = httpd_resp_sendstr_chunk(req, CAMERA_ERROR_HTML_TAIL);
+  }
+  if (res == ESP_OK) {
+    res = httpd_resp_sendstr_chunk(req, NULL);  // terminates the chunked body
+  }
+  return res;
+}
+
+// One answer shared by /status, /control and /stream while the camera is down,
+// so a client gets a stated reason instead of an empty or hanging response.
+static esp_err_t sendCameraUnavailable(httpd_req_t *req) {
+  return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                             "camera unavailable");
+}
+
 static esp_err_t indexHandler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
+  if (!isCameraReady) {
+    return sendCameraErrorPage(req);
+  }
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -126,9 +186,8 @@ static bool peakStationRssi(int8_t *rssiOut, int *clientsOut) {
 
 static esp_err_t statusHandler(httpd_req_t *req) {
   sensor_t *sensor = esp_camera_sensor_get();
-  if (!sensor) {
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "camera sensor unavailable");
+  if (!isCameraReady || !sensor) {
+    return sendCameraUnavailable(req);
   }
 
   const uint32_t interval = frameIntervalMs;
@@ -171,9 +230,8 @@ static esp_err_t controlHandler(httpd_req_t *req) {
   }
 
   sensor_t *sensor = esp_camera_sensor_get();
-  if (!sensor) {
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "camera sensor unavailable");
+  if (!isCameraReady || !sensor) {
+    return sendCameraUnavailable(req);
   }
 
   const int value = atoi(val);
@@ -212,6 +270,10 @@ static esp_err_t controlHandler(httpd_req_t *req) {
 }
 
 static esp_err_t streamHandler(httpd_req_t *req) {
+  if (!isCameraReady) {
+    return sendCameraUnavailable(req);
+  }
+
   esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
   if (res != ESP_OK) {
     return res;
@@ -308,12 +370,14 @@ static bool initCamera() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
+    cameraInitError = err;
     Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
 
   sensor_t *sensor = esp_camera_sensor_get();
   if (!sensor) {
+    cameraInitError = ESP_ERR_CAMERA_NOT_DETECTED;
     Serial.println("Camera sensor not found");
     return false;
   }
@@ -391,10 +455,11 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
-  if (!initCamera()) {
-    halt("camera not available");
-  }
-
+  // Wi-Fi and the HTTP servers come up before the camera, and a camera fault no
+  // longer halts the board. With the camera first, an unplugged ribbon cable and
+  // a dead radio produced the same symptom from outside -- no SSID at all -- and
+  // telling them apart needed a USB cable and a serial monitor. Now the AP
+  // always appears and the page at 192.168.4.1 names the fault.
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, false,
                    AP_MAX_CONNECTIONS)) {
@@ -413,15 +478,25 @@ void setup() {
     Serial.printf("Failed to fix the AP to 802.11b: 0x%x\n", protocolErr);
   }
 
+  uint8_t p;
+  esp_wifi_get_protocol(WIFI_IF_AP, &p);
+  Serial.printf("protocol bitmap: 0x%02X\n", p);  // 0x01 なら11bのみ
+
   if (!startWebServer() || !startStreamServer()) {
     halt("HTTP server not available");
   }
 
-  Serial.println("Camera streamer ready");
+  isCameraReady = initCamera();
+
   Serial.printf("SSID: %s / Password: %s\n", AP_SSID, AP_PASSWORD);
   Serial.print("Open http://");
   Serial.print(WiFi.softAPIP());
   Serial.println("/ in a browser");
+  if (isCameraReady) {
+    Serial.println("Camera streamer ready");
+  } else {
+    Serial.println("Camera unavailable: serving the error page, not the stream");
+  }
 }
 
 void loop() {
